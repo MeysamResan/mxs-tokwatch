@@ -4,11 +4,16 @@ param(
     [string]$Task = 'Verify',
     [ValidateSet('Debug', 'Release')]
     [string]$Configuration = 'Release',
-    [string]$Target = ''
+    [string]$Target = '',
+    [string]$TestFilter = '',
+    [switch]$IncludeIgnored
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+if (($TestFilter -or $IncludeIgnored) -and $Task -ne 'Test') {
+    throw 'TestFilter and IncludeIgnored are only supported with -Task Test.'
+}
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $localCargo = Join-Path $projectRoot '.tools\cargo\bin\cargo.exe'
 $savedEnvironment = @{}
@@ -60,10 +65,14 @@ try {
         $buildArguments += '--release'
     }
 
+    $testArguments = @('test', '--all-targets') + $targetArguments
+    if ($TestFilter) { $testArguments += $TestFilter }
+    if ($IncludeIgnored) { $testArguments += @('--', '--ignored', '--nocapture') }
+
     switch ($Task) {
         'Build' { Invoke-Cargo -Arguments $buildArguments }
         'Check' { Invoke-Cargo -Arguments (@('check', '--all-targets') + $targetArguments) }
-        'Test' { Invoke-Cargo -Arguments (@('test', '--all-targets') + $targetArguments) }
+        'Test' { Invoke-Cargo -Arguments $testArguments }
         'Lint' { Invoke-Cargo -Arguments (@('clippy', '--all-targets') + $targetArguments + @('--', '-D', 'warnings')) }
         'Format' { Invoke-Cargo -Arguments @('fmt', '--all') }
         'Verify' {

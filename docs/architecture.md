@@ -1,115 +1,146 @@
 # Architecture
 
-TokWatch is a Windows notification-area application with a native Win32 panel. Rust owns its state and worker coordination; Microsoft Windows bindings provide the tray, controls, drawing, registry, and process APIs. `serde` and `serde_json` handle data conversion. There is no webview, managed runtime, embedded browser, or database.
+TokWatch is a Windows notification-area application with a native Win32 panel. Rust owns state and worker coordination; Microsoft Windows bindings provide controls, drawing, registry, and process APIs. `serde` and `serde_json` handle data conversion. There is no webview, managed UI runtime, embedded browser, or database.
+
+This document describes TokWatch v0.2.0. Release history is summarized in the changelog.
 
 ## Modules
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.rs` | Entry point and Windows-only UI dispatch |
-| `src/ui.rs` | Tray icon, native panel controls, menu, timers, worker commands, and optional startup entry |
-| `src/ui_style.rs` | Light/dark palettes, compact panel surfaces, progress meter, icons, and owner-drawn labels/buttons |
-| `src/ui_render.rs` | Cached Direct2D/DirectWrite drawing, antialiased shapes, text layout, and test measurements |
-| `src/ui_tray_tests.rs` | Native icon dimensions, transparency, progress color, and unknown-state checks |
-| `src/ui_tray.rs` | Explicit percentage icons with native-size premultiplied-alpha output |
-| `src/codex.rs` | Executable discovery, app-server process lifetime, protocol framing, and account access |
-| `src/model.rs` | Bounded usage model, optional-field handling, remaining percentages, and countdowns |
-| `src/settings.rs` | Settings and minimized usage-cache persistence |
+| `src/main.rs` | Entry point, helper modes, and Windows UI dispatch |
+| `src/ui.rs` | Tray activation, native panel, provider menu, timers, worker coordination, and startup option |
+| `src/ui_style.rs` | Fixed black/charcoal/deep-red panel palette and owner-drawn controls |
+| `src/ui_render.rs` | Cached Direct2D/DirectWrite drawing, text layout, and test measurements |
+| `src/ui_tray.rs` | Colored percentage text with transparent, native-size premultiplied-alpha output |
+| `src/ui_tray_tests.rs` | Actual icon dimensions, transparent perimeter, glyph colors, and unknown-state checks |
+| `src/codex.rs` | Codex executable discovery, app-server lifetime, protocol framing, and account reads |
+| `src/claude.rs` | Claude Code status-line setup, bounded feed input, local feed storage, and subscription normalization |
+| `src/updater.rs` | GitHub release discovery, verified installer downloads, and update handoff |
+| `src/installation.rs` | Refresh an existing matching Installed Apps version after an in-place update |
+| `src/model.rs` | Bounded usage model, optional fields, remaining percentages, and countdowns |
+| `src/settings.rs` | Provider and update preferences, settings, and minimized usage-cache persistence |
 | `src/ui_tests.rs` | Native layout, input validation, and callback regression checks |
-| `build.rs` / `app.manifest` | Build-only manifest embedding for native controls, DPI awareness, and normal user privileges |
+| `build.rs` / `app.manifest` | Build-only manifest embedding for native controls, DPI awareness, and normal privileges |
 
-The main thread owns Windows controls and processes the Windows message queue. A worker waits for refresh or sign-in commands. Each active Codex client has a bounded reply queue and a dedicated pipe reader, so account requests do not block the UI thread.
+The main thread owns Windows controls and the message queue. Account and update work happens off the UI thread. Each active Codex client uses a bounded reply queue and dedicated pipe reader. Idle workers wait for commands instead of continuously polling a service.
 
-## Native panel design
+## Native panel and tray
 
-The panel is 320 by 320 logical pixels, about 56% less area than the previous 420 by 560 layout. It scales using the monitor DPI, with its scale capped to fit the available monitor work area and placement clamped at screen edges. Fitting also applies when the window moves between display scales. The tray icon keeps the actual monitor DPI. One compact usage card emphasizes the remaining percentage and meter. Two stat columns below it separate the scheduled reset countdown from the available full-reset count without additional card containers. The header holds the app identity and plan badge; compact credit and status rows lead to the primary action and Settings button.
+Clicking or keyboard-activating the tray icon opens the panel; activating it again closes it. Escape or focus moving to another window dismisses it. Hover does not open the panel. Right-clicking the tray icon opens the menu.
 
-Windows provides the top-level rounded window through DWM attributes. The app follows the system light/dark theme and updates the background, surfaces, borders, text, and mint accent together when the theme changes. Direct2D draws antialiased geometry, while DirectWrite renders Segoe UI with grayscale antialiasing and fractional font sizes. Coordinates use physical pixels at the window's actual display scale; the panel is never drawn to a bitmap and stretched. The Direct2D DC render target, solid brush, DirectWrite factory, and text formats are cached per UI thread. A failed graphics operation allows a GDI fallback, and device loss recreates the target on the next paint. There is no rendering loop or additional UI framework.
+The panel uses a fixed black and dark-gray palette, `#7D0000` surfaces, and bright red highlights. Its rounded top-level window uses DWM attributes. The tray separately follows the Windows taskbar theme for legible text on light and dark backgrounds. Normal allowance uses light gray or charcoal, 21-50% uses muted red, 0-20% uses a stronger red, and unknown data uses neutral gray.
 
-The tray includes the percent sign for known values, including `26%` and `100%`. Its small transparent icon uses eight-times supersampling when the displayed value, theme, or scale changes, then produces an exact-size premultiplied-alpha image for Explorer. Native 16, 20, 24, and 32 pixel outputs are checked independently; supersampling is confined to the tray icon and does not affect panel text.
+The percentage is a conventional notification-area icon registered with `Shell_NotifyIconW`. Windows owns the icon slot and its position among the other system-tray icons. `GetSystemMetricsForDpi(SM_CXSMICON, dpi)` supplies the target bitmap size: 16 pixels at 100% scaling. The renderer fits a single colored number-and-percent text run without changing its proportions and uses antialiased premultiplied-alpha pixels on a transparent background. Icon generation is cached until the displayed value, theme, provider, or DPI changes.
 
-The text labels remain native `SS_OWNERDRAW` child controls, and buttons also retain their native control identities. Their accessible text stays on the window controls while custom painting provides consistent text and surfaces. Buttons preserve standard keyboard behavior with distinct hover, pressed, disabled, and keyboard-focus states. The primary action is Refresh for a connected account and Connect to Codex when authentication is needed. A cached paint theme allows native controls to request drawing safely during nested Windows callbacks.
+There is no taskbar child window, Explorer layout hook, floating label, or saved desktop position. Click opens the details panel anchored to `Shell_NotifyIconGetRect`; right-click opens settings. Hover notifications are ignored. Taskbar recreation re-registers the icon, and failed registration is retried by the existing five-second timer.
 
-Server-provided labels and secondary metadata use bounded controls and ellipsis where needed. Unknown data retains explicit unavailable wording instead of a fabricated zero. The UI separates these states from current usage and continues to display local countdowns without additional account requests.
+Panel coordinates scale with the monitor DPI and are capped to fit the available work area. Placement is clamped at screen edges. Direct2D draws geometry, and DirectWrite renders Segoe UI with grayscale antialiasing and fractional font sizes at the actual display resolution. The panel is never rasterized at one scale and stretched to another.
 
-## Account connection
+The Direct2D render target, brush, DirectWrite factory, and text formats are cached on the UI thread while the panel is open and released when it closes. Graphics failure permits a GDI fallback; device loss recreates the target on the next paint. There is no continuous rendering loop.
+
+Labels and buttons remain native child controls with accessible names. Custom drawing retains keyboard navigation and visible focus, pressed, hover, and disabled states. A cached paint theme permits drawing during nested Windows callbacks. Bounded labels use ellipsis where necessary. Missing values use unavailable wording rather than a fabricated zero.
+
+## Provider selection
+
+The menu selects Codex or Claude Code and saves that choice. The UI routes refresh and connection actions to the selected provider. A provider switch must not display another provider's cached usage as current. Account selection remains owned by the selected provider's installation; TokWatch does not manage an independent list of sign-ins.
+
+Both providers normalize into usage windows with used percentages, durations, reset timestamps, and the source reading's time. Optional fields stay optional. Codex-only full resets and credits are not invented for Claude Code.
+
+## Codex account connection
 
 ```text
-TokWatch native UI
-    |
-    | worker command
-    v
-Hidden native Codex helper
-    codex.exe app-server --listen stdio://
-    |
-    | Codex-managed authentication and account requests
-    v
-OpenAI account service
+TokWatch UI -> account worker -> hidden native Codex helper
+                                   |
+                                   | Codex-managed authentication and requests
+                                   v
+                              OpenAI account service
 ```
 
-The local protocol is newline-delimited JSON over redirected standard input and output. TokWatch completes `initialize` / `initialized`, then calls `account/read` and `account/rateLimits/read`. It does not create threads, send model prompts, or invoke reset redemption. The only sign-in action, `account/login/start` with `type: "chatgpt"`, follows a user selecting **Connect**.
+The worker starts `codex.exe app-server --listen stdio://`. Newline-delimited JSON flows over redirected standard input/output. TokWatch completes `initialize` / `initialized`, then calls `account/read` and `account/rateLimits/read`. It does not create conversations, send model prompts, or redeem resets. `account/login/start` with `type: "chatgpt"` follows the user's Connect action.
 
-A normal refresh owns a new helper client for the duration of the account read. The client is then dropped and the process released. Browser sign-in retains its helper until an explicit account/login/completed event with the matching login ID arrives, with a five-minute sign-in limit. Each individual protocol request has a 30-second timeout.
+A normal refresh owns a fresh helper client only for the account read. Browser sign-in retains the helper until a matching `account/login/completed` event, with a five-minute limit. Individual requests time out after 30 seconds.
 
-On Windows, the helper is launched without a console window and attached to a job configured to kill its processes when the job closes. Client shutdown closes input, releases the job, terminates and waits for the helper, and joins the pipe reader. The helper's working directory is the user profile instead of the directory from which TokWatch happened to launch.
+The Windows helper starts without a console and belongs to a job configured to kill its processes when the job closes. Shutdown closes input, releases the job, terminates and waits for the helper, and joins the reader. The helper uses the user profile as its working directory.
 
-Authentication belongs to Codex. TokWatch does not read Codex authentication files or retain credentials. Protocol diagnostics from the helper are discarded; user-facing failures are generated locally. Replies are bounded to 1 MiB and the reader queue holds at most eight messages. Unexpected server requests are not approved.
+Authentication belongs to Codex. TokWatch does not read authentication files or store credentials. It discards helper diagnostics and produces local user-facing errors. Replies are limited to 1 MiB and the reader queue holds at most eight messages. Unexpected server requests are not approved.
 
-The implementation follows the official [Codex app-server interface](https://learn.chatgpt.com/docs/app-server). Compatibility is checked through the real handshake and account calls rather than a hard-coded executable version requirement. Installed-version differences can therefore surface as an unsupported-interface error.
+The implementation follows the official [Codex app-server interface](https://learn.chatgpt.com/docs/app-server). Compatibility is tested through the handshake and account calls rather than a hard-coded executable version requirement. API-key accounts are reported separately because they do not supply ChatGPT subscription limits.
 
-## Discovery and account choice
+An explicit executable path takes precedence. Automatic discovery checks native executables in absolute PATH directories, supported npm package layouts, and versioned helpers under `%LOCALAPPDATA%\OpenAI\Codex\bin`. Executables launch directly without a command shell. A chosen path must be absolute, existing, and end in `.exe` on Windows.
 
-An explicit path chosen in settings takes precedence. Automatic discovery checks:
+## Claude Code status-line connection
 
-1. Native Codex executables in absolute PATH directories.
-2. Supported npm package layouts, including nested and hoisted Windows platform packages.
-3. Versioned helpers under `%LOCALAPPDATA%\OpenAI\Codex\bin`, selecting the most recently modified executable.
+```text
+Claude Code session -> status-line JSON -> TokWatch.exe --claude-statusline
+                                                |
+                                                | normalized local feed
+                                                v
+TokWatch UI <- account worker <- claude-statusline.json
+```
 
-The client launches the executable directly, without a command shell. A chosen path must be absolute, point to an existing file, and have an `.exe` extension on Windows.
+Claude Code's official [status-line JSON](https://code.claude.com/docs/en/statusline) exposes subscription `rate_limits` for Pro and Max accounts after a response. The feed is driven by Claude Code session events. Reading it does not send model prompts, and TokWatch never calls an undocumented subscription endpoint or reads Claude credentials.
 
-The account is whichever ChatGPT sign-in the selected helper exposes through its configured Codex home. This version does not maintain an independent account list or support switching among several accounts inside TokWatch. An API-key account is reported separately because it does not supply ChatGPT subscription limits.
+**Connect Claude Code** installs a status-line command in `%USERPROFILE%\.claude\settings.json`, respecting an absolute `CLAUDE_CONFIG_DIR` override. It preserves unrelated settings and backs up the original configuration to a sibling `.settings.tokwatch-backup.PID.SEQ.json` file. An existing unrelated `statusLine` is not overwritten: TokWatch writes `%LOCALAPPDATA%\TokWatch\claude-statusline-settings.json` as a setup snippet and returns an actionable message for manual integration.
 
-## Usage semantics
+The `--claude-statusline` mode bounds its standard input and persists only normalized numeric `five_hour` and `seven_day` allowance windows, resets, and timestamps in `%LOCALAPPDATA%\TokWatch\claude-statusline.json`. It does not save the original session JSON, which can contain unrelated session data. An input without subscription limits replaces earlier limits with an unknown state.
 
-The tray renderer draws an antialiased circular progress arc on a theme-aware track. The full percentage remains centered, using larger digits and a smaller percent suffix with matching baseline; each glyph group keeps its natural aspect ratio. Eight samples per axis smooth the circle and typography before the exact native-size premultiplied BGRA icon is handed to Windows. The ring and panel meter share remaining-allowance thresholds: green above 50%, amber at 21–50%, and red at 0–20%. Unknown and stale readings use a neutral question-mark gauge.
+TokWatch checks the local feed every 15 seconds. A read preserves the feed's source timestamp; repeatedly reading an old file never makes it fresh. The UI shows its age, marks stale readings unknown, and treats expired windows as unknown until a new source reading arrives. Refresh only rereads this local file. It cannot request an independent Claude service refresh.
 
-The model consumes the available per-pool rate-limit map and falls back to the legacy single-pool response. Each returned usage window keeps its actual duration and reset timestamp. Window labels are derived from duration rather than assuming every primary window is five hours.
+Project or managed status-line settings, or `disableAllHooks`, can prevent the global command from running. Existing Claude sessions may need to reload settings. Keep the TokWatch executable in its permanent folder because the command points to that path. After moving it or installing a portable copy, explicit Connect can relocate an exactly recognized generated TokWatch bridge while preserving custom commands. Removing the integration means removing TokWatch's `statusLine` entry or carefully restoring the saved prior configuration without losing later edits.
 
-Remaining allowance is `floor(100 - clamp(usedPercent, 0, 100))`. Missing and non-finite values remain unknown. Automatic selection prefers the main Codex pool and its known window with the lowest remaining percentage; a saved window selection is retained while that window exists.
+Claude web-only usage, model-specific weekly meters, extra credits, and full-reset credits are not supplied by this integration. Context-window percentages and API spending are not used as substitutes for subscription allowance.
 
-The available reset count comes from the service's explicit count. It is not inferred from the length of a potentially truncated reset-credit list. Expiry text uses the earliest known available-credit expiry. Extra-credit balances retain the reported string in the model without inventing a currency or unit. The panel formats ordinary numeric balances to two decimal places and uses ellipsis for oversized labels.
+## Usage and freshness semantics
 
-Countdowns use the service timestamp and the local clock. At or after a reset time, the panel indicates that the reset is due and awaits confirmation from a new reading. The app does not manufacture a 100% reading when a countdown expires.
+Remaining allowance is `floor(100 - clamp(usedPercent, 0, 100))`. Missing or non-finite values stay unknown. Automatic selection chooses the known window with the least remaining allowance, preferring the main Codex pool when available. A saved window selection remains effective while the window exists. Labels use the reported duration instead of assuming all primary windows last five hours.
 
-Graphics resources are reused while the panel is open and released when it closes, keeping the resident tray from retaining the panel render target. Reopening creates them on demand.
+Codex reads the available per-pool map, falling back to the legacy single-pool response. Reset counts use the explicit service count, not the length of a possibly truncated credit list. Expiry text uses the earliest known available-credit expiry. Extra-credit balances retain the reported string without inventing a currency; the panel formats ordinary numeric values to two decimal places.
 
-## Refresh and stale data
+Countdowns use the service reset time and local clock. Reaching zero does not establish replenishment. The app waits for a new reading instead of manufacturing 100% allowance.
 
-The default refresh interval is 120 seconds. The menu offers 60, 120, 300, and 600 seconds; settings normalization bounds manually edited values to 60â€“1800 seconds. A five-second UI timer schedules due work, and overlapping requests are suppressed. Resume notifications request a refresh. Connection failures increase the delay exponentially, capped at 30 minutes; manual refresh remains available.
+The default Codex interval is 120 seconds; the menu offers 60, 120, 300, and 600 seconds. Settings normalization bounds manually edited intervals to 60-1800 seconds. Overlapping requests are suppressed, resume requests a refresh, and connection failures back off up to 30 minutes. Manual refresh remains available. Claude feed reads use their own 15-second interval.
 
-The worker sleeps between commands. The tray icon is regenerated when its displayed text, theme, or scale changes. The visible panel has a short timer for hover dismissal and local countdown rendering; it does not request account information on each visual update.
+Cached readings start unverified after launch. Failure or age makes the tray show `?`; the panel can retain the last known percentage with cached wording. The ordinary age threshold is twice the polling interval, with a three-minute minimum. A confirmed signed-out or API-key Codex account clears its prior usage cache. Local countdown repainting does not trigger account network requests.
 
-Cached readings begin unverified after launch. A failed refresh or an old reading makes the tray show `?`, while the panel can retain the last known percentage with cached wording. The age threshold is twice the polling interval, with a three-minute minimum. A confirmed signed-out or API-key account clears the prior usage cache.
+## GitHub application updates
+
+Automatic checks are enabled by default, occur at startup and every six hours, and can be disabled in the menu. Manual checking remains available. Discovery and downloading use the fixed `MeysamResan/mxs-tokwatch` repository, not a configurable feed supplied by a remote response.
+
+The updater accepts a newer numeric `vMAJOR.MINOR.PATCH` published release with one versioned **TokWatch-Setup-vMAJOR.MINOR.PATCH-windows-x64.exe** asset and its GitHub-provided SHA-256 digest. A source commit or tag by itself is not an update. Preview `0.x` builds consider published previews and stable releases; stable `1.x` and later builds consider stable releases only.
+
+Downloads use bounded HTTPS requests to permitted GitHub/CDN hosts. Windows CNG verifies the SHA-256 digest from GitHub release-asset metadata. A missing or malformed digest makes a release ineligible. The staged file, `.TokWatch-update-{version}-{pid}-{timestamp}.exe`, sits beside the installed executable and is verified before installation is offered. **Restart to update** runs the verified installer silently in the existing app folder after the running app exits. Setup upgrades all installed files and registration. The helper waits for the original process, identified by PID and creation time, to exit. The previous executable is retained through replacement and relaunch checks, and restored if either fails. The original executable fingerprint is rechecked before replacement. A manually changed target is preserved and is not automatically launched. Recovery only relaunches an executable whose checksum matches the original. The application directory must be writable by the current user; the installer does not request elevation. Failures are recorded in `%LOCALAPPDATA%\TokWatch\update-error.txt` for the next startup.
+
+GitHub, HTTPS, and control of the fixed repository are the update trust boundary. Checksums detect damaged or mismatched files; they do not authenticate the publisher independently of GitHub, and the preview binary remains unsigned. GitHub update traffic is separate from provider account data.
 
 ## Storage and startup
 
-Settings and cache files live under `%LOCALAPPDATA%\TokWatch`:
+Files under `%LOCALAPPDATA%\TokWatch` include:
 
-- `settings.json`: polling interval, optional native Codex path, and optional selected-window key.
-- `usage-cache.json`: normalized usage data and its fetch timestamp.
+- `settings.json`: provider, automatic-update preference, Codex interval, optional executable path, and selected usage window.
+- `usage-cache.json`: minimized normalized usage data and its source timestamp.
+- `claude-statusline.json`: normalized Claude Code subscription windows and timestamps.
+- `claude-statusline-settings.json`: setup snippet when a custom status line requires manual integration.
+- `update-error.txt`: an updater failure report consumed at the next startup. Staged downloads and replacement backups reside beside the installed EXE.
 
-The cache excludes account identifiers, credentials, raw replies, and reset-credit IDs. File reads have size limits. Writes use a unique sibling temporary file, flush it, then replace the destination, preserving the previous file if replacement fails.
+Usage data excludes credentials, account email addresses, raw protocol/status-line replies, and reset-credit IDs. File reads are bounded. Settings and usage writes flush a unique sibling temporary file and replace the destination, preserving the previous file if replacement fails.
 
-Startup is opt-in through a quoted executable path in the current user's `Run` registry key. The app uses a local named mutex to prevent a second instance in the same Windows session.
+Startup is opt-in through a quoted executable path in the current user's `Run` registry key. A local named mutex prevents a second UI instance in the same Windows session. Helper modes run without opening the tray UI.
 
-## Resource tradeoff and validation
+## Windows installation
 
-This implementation prioritizes a small resident tray process by closing the Codex helper after each normal reading. That saves helper memory between refreshes at the cost of another helper startup for the next read. Helper startup cost and the tray application's long-term resource behavior require measurement across systems.
+The local Inno Setup package installs for the current user under `%LOCALAPPDATA%\Programs\TokWatch`, allowing the existing updater to replace the executable without elevation. A stable AppId preserves upgrade and uninstall identity. The installer adds a Start menu shortcut, optional desktop shortcut, and 64-bit HKCU Installed Apps registration. Setup gracefully closes TokWatch using its native Exit command; WM_CLOSE only hides its panel.
 
-The local tooling uses Rust 1.98.1 targeting `x86_64-pc-windows-gnullvm` with LLVM-MinGW. The Cargo host remains the local Rust GNU installation; the script selects the LLVM target and its matching linker for the application. Only a narrow import-tool directory is added to PATH, preserving the host linker. Output is under `target/x86_64-pc-windows-gnullvm/release`. A convenience delivery copy can live at `dist/TokWatch.exe`.
+The installer migrates an existing startup value only when it recognizes the installed target or the running copy it closed. Uninstall removes only its own exact startup command and Claude Code bridge, preserves preferences and cached usage, and leaves provider installations alone. On a normal launch the app updates DisplayVersion only when an existing registration has a matching installation directory. Portable runs create no registration. The only public download asset is the versioned setup executable. Its SHA-256 digest is supplied by GitHub; no portable executable, ZIP, or checksum text file is needed.
 
-The source uses Windows APIs through Microsoft's Rust bindings. MSVC is the documented standard Windows developer setup, but it has not been exercised in this local validation run. `.cargo/config.toml` requests static C/unwind runtime linking for x64 MSVC and GNU-LLVM, so the private compiler DLLs are build-time tools rather than application dependencies. `build.rs` uses the build-only `embed-manifest` crate to embed `app.manifest`; no manifest helper runs with the application.
+See [installer details](windows-installer.md) for tooling and package verification.
 
-Unit tests cover response normalization, incomplete fields, countdown boundaries, settings defaults and persistence, account classification, sign-in URL validation, protocol limits, and diagnostic redaction. The current suite passes 24 automated tests. Native UI checks cover 30 combinations of control bounds and DirectWrite text layout at 96, 120, 144, 168, and 192 DPI (100%, 125%, 150%, 175%, and 200% scaling), in both light and dark themes, with normal, missing, and long account metadata. They produce 12 panel captures and exercise 48 tray variants at 16, 20, 24, and 32 pixels. Checks also cover native accessible label/button names, keyboard-focus styles, invalid reset dates and authentication URLs, and nested callback handling. An ignored live test performs the real handshake and read-only account queries and checks helper shutdown. Browser login remains implemented but unverified end to end; demo mode supplies simulated data for UI inspection without account requests.
+## Build and validation
 
+Use `scripts/build.ps1` for formatting, linting, tests, and local builds. The private toolchain targets `x86_64-pc-windows-gnullvm` using Rust 1.98.1 and LLVM-MinGW. The standard developer setup is MSVC Rust with the Windows SDK and C++ build tools; MSVC still needs a separate validation run.
 
+The release statically links the C/unwind runtime for supported x64 targets and uses normal Windows system DLLs. Build-only manifest embedding has no runtime helper. `.tools`, `target`, `dist`, and `.verification` stay out of source control. Packaging does not publish anything.
+
+Automated checks cover protocol normalization, missing fields, provider configuration, feed freshness, update parsing and verification, cache persistence, native layout, DirectWrite text fit, accessible controls, callback handling, and colored percentage icons. Rendering tests write panel and tray captures for visual inspection. An ignored live Codex test performs the handshake and read-only account calls and checks helper shutdown. Demo mode supplies simulated data without querying an account.
+
+The README and v0.2.0 release notes record completed local validation. Live Claude session setup, actual replacement by a future release, fresh Codex browser sign-in, and broader interactive and long-running behavior need manual validation appropriate to the change; earlier v0.1.0 test counts are not claims about this preview.

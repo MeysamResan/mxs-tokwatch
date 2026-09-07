@@ -6,6 +6,7 @@ enum Fixture {
     Normal,
     Missing,
     Long,
+    Claude,
 }
 
 impl Fixture {
@@ -14,12 +15,14 @@ impl Fixture {
             Self::Normal => "normal",
             Self::Missing => "missing",
             Self::Long => "long",
+            Self::Claude => "claude",
         }
     }
 
     fn snapshot(self) -> UsageSnapshot {
         match self {
             Self::Normal => demo_snapshot(),
+            Self::Claude => demo_snapshot_for(Provider::Claude),
             Self::Missing => UsageSnapshot::from_response(serde_json::json!({
                 "rateLimits": {"primary": {"windowDurationMins": 10080}}
             }))
@@ -55,7 +58,12 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
         });
         for dpi in [96u32, 120, 144, 168, 192] {
             for dark in [false, true] {
-                for fixture in [Fixture::Normal, Fixture::Missing, Fixture::Long] {
+                for fixture in [
+                    Fixture::Normal,
+                    Fixture::Missing,
+                    Fixture::Long,
+                    Fixture::Claude,
+                ] {
                     let hwnd = CreateWindowExW(
                         WS_EX_TOOLWINDOW,
                         name,
@@ -73,7 +81,14 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                     .unwrap();
                     let host = new_host(
                         hwnd,
-                        Settings::default(),
+                        Settings {
+                            provider: if matches!(fixture, Fixture::Claude) {
+                                Provider::Claude
+                            } else {
+                                Provider::Codex
+                            },
+                            ..Settings::default()
+                        },
                         Some(fixture.snapshot()),
                         true,
                         None,
@@ -115,10 +130,15 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                             Fixture::Long => {
                                 assert_eq!(label_text(app.labels[4]), "100%");
                             }
+                            Fixture::Claude => {
+                                assert_eq!(label_text(app.labels[4]), "72%");
+                                assert_eq!(label_text(app.labels[11]), "86%");
+                                assert_eq!(label_text(app.labels[14]), "Claude Code");
+                            }
                         }
                     }
                     host.flush(hwnd);
-                    // Capture both native and fractional-scale renderings. All 30
+                    // Capture both native and fractional-scale renderings. All 40
                     // configurations use the renderer's actual DirectWrite metrics.
                     if matches!(dpi, 96 | 144) {
                         capture_test_panel(hwnd, &host, dark, fixture);
@@ -561,5 +581,92 @@ fn flyout_geometry_stays_inside_scaled_and_offset_work_areas() {
         if name == "top-edge tray" {
             assert!(bounds.top >= 48, "top tray should open into the work area");
         }
+    }
+}
+
+#[test]
+fn tray_opens_only_on_selection_and_switches_provider_without_leaking_usage() {
+    unsafe {
+        let instance = GetModuleHandleW(None).unwrap();
+        let name = w!("TokWatch.Native.ClickProviderTest");
+        RegisterClassW(&WNDCLASSW {
+            lpfnWndProc: Some(window_proc),
+            hInstance: instance.into(),
+            lpszClassName: name,
+            ..Default::default()
+        });
+        let hwnd = CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            name,
+            w!("TokWatch click test"),
+            WS_POPUP,
+            0,
+            0,
+            PANEL_WIDTH,
+            PANEL_HEIGHT,
+            None,
+            None,
+            Some(instance.into()),
+            None,
+        )
+        .unwrap();
+        let host = new_host(hwnd, Settings::default(), Some(demo_snapshot()), true, None);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*host as *const Host) as isize);
+        host.app.borrow_mut().create_controls();
+        SendMessageW(
+            hwnd,
+            TRAY,
+            Some(WPARAM(0)),
+            Some(LPARAM(NIN_POPUPOPEN as isize)),
+        );
+        assert!(!host.app.borrow().visible, "hover must not open the panel");
+        SendMessageW(
+            hwnd,
+            TRAY,
+            Some(WPARAM(0)),
+            Some(LPARAM(NIN_SELECT as isize)),
+        );
+        assert!(host.app.borrow().visible, "click opens the panel");
+        SendMessageW(
+            hwnd,
+            TRAY,
+            Some(WPARAM(0)),
+            Some(LPARAM(NIN_POPUPCLOSE as isize)),
+        );
+        assert!(
+            host.app.borrow().visible,
+            "ending hover must not dismiss a clicked panel"
+        );
+        SendMessageW(
+            hwnd,
+            TRAY,
+            Some(WPARAM(0)),
+            Some(LPARAM(NIN_SELECT as isize)),
+        );
+        assert!(!host.app.borrow().visible, "second click closes the panel");
+        SendMessageW(
+            hwnd,
+            TRAY,
+            Some(WPARAM(0)),
+            Some(LPARAM(NIN_KEYSELECT as isize)),
+        );
+        assert!(
+            host.app.borrow().visible,
+            "keyboard selection opens the panel"
+        );
+        {
+            let mut app = host.app.borrow_mut();
+            app.switch_provider(Provider::Claude);
+            app.render();
+            assert_eq!(app.settings.provider, Provider::Claude);
+            assert_eq!(app.selected().unwrap().0.id, "claude");
+            assert_eq!(label_text(app.labels[4]), "72%");
+            assert!(app.snapshot.as_ref().unwrap().reset_credits.is_none());
+            app.switch_provider(Provider::Codex);
+            assert_eq!(app.selected().unwrap().0.id, "codex");
+            assert!(app.update_rx.is_none(), "demo must not check GitHub");
+        }
+        destroy_test_panel(hwnd, &host);
+        let _ = UnregisterClassW(name, Some(instance.into()));
     }
 }

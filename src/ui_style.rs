@@ -18,35 +18,19 @@ pub(super) struct Palette {
     pub(super) button_hover: COLORREF,
 }
 
-pub(super) fn palette(dark: bool) -> Palette {
-    if dark {
-        Palette {
-            bg: color(18, 21, 27),
-            surface: color(27, 32, 40),
-            border: color(44, 51, 63),
-            text: color(241, 245, 249),
-            muted: color(155, 168, 185),
-            accent: color(111, 231, 194),
-            accent_bg: color(31, 61, 54),
-            track: color(48, 58, 70),
-            warning: color(246, 193, 104),
-            danger: color(255, 137, 148),
-            button_hover: color(39, 47, 58),
-        }
-    } else {
-        Palette {
-            bg: color(245, 247, 249),
-            surface: color(255, 255, 255),
-            border: color(220, 227, 233),
-            text: color(25, 36, 47),
-            muted: color(98, 114, 129),
-            accent: color(21, 129, 100),
-            accent_bg: color(221, 245, 234),
-            track: color(228, 235, 239),
-            warning: color(153, 99, 16),
-            danger: color(186, 55, 73),
-            button_hover: color(233, 239, 243),
-        }
+pub(super) fn palette(_dark: bool) -> Palette {
+    Palette {
+        bg: color(8, 8, 9),
+        surface: color(22, 22, 24),
+        border: color(53, 35, 38),
+        text: color(242, 240, 241),
+        muted: color(167, 160, 163),
+        accent: color(255, 55, 65),
+        accent_bg: color(125, 0, 0),
+        track: color(43, 39, 41),
+        warning: color(235, 120, 125),
+        danger: color(255, 60, 70),
+        button_hover: color(65, 17, 22),
     }
 }
 
@@ -224,11 +208,7 @@ pub(super) unsafe fn paint_button(
         let (fill, border, foreground) = if disabled {
             (colors.surface, colors.border, colors.muted)
         } else if primary {
-            let base = if dark {
-                colors.accent
-            } else {
-                color(18, 112, 87)
-            };
+            let base = colors.accent_bg;
             let fill = if pressed {
                 mix(base, color(0, 0, 0), 13)
             } else if hovered {
@@ -236,15 +216,7 @@ pub(super) unsafe fn paint_button(
             } else {
                 base
             };
-            (
-                fill,
-                fill,
-                if dark {
-                    color(13, 45, 35)
-                } else {
-                    color(255, 255, 255)
-                },
-            )
+            (fill, colors.accent, colors.text)
         } else {
             let fill = if pressed {
                 colors.track

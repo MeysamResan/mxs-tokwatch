@@ -1,8 +1,8 @@
 [package]
 name = "tokwatch"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "A lightweight native Windows tray monitor for Codex usage"
+description = "A lightweight native Windows tray monitor for Codex and Claude usage"
 license = "MIT"
 repository = "https://github.com/MeysamResan/mxs-tokwatch"
 readme = "README.md"
@@ -16,6 +16,7 @@ serde_json = "1"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62", features = [
+  "Win32_Networking_WinHttp", "Win32_Security_Cryptography",
   "Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Graphics_Dwm",
   "Win32_Graphics_Direct2D", "Win32_Graphics_Direct2D_Common", "Win32_Graphics_DirectWrite", "Win32_Graphics_Dxgi_Common", "Win32_Security",
   "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_System_Threading",

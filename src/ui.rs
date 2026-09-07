@@ -1,7 +1,9 @@
 use crate::{
+    claude,
     codex::{self, AccountStatus, Client},
     model::{self, UsageSnapshot},
-    settings::{self, Settings},
+    settings::{self, Provider, Settings},
+    updater,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -63,7 +65,14 @@ const TRAY: u32 = WM_APP + 1;
 const RESULT: u32 = WM_APP + 2;
 const SHOW_PANEL: u32 = WM_APP + 4;
 const TICK: usize = 1;
-const HOVER: usize = 2;
+const PANEL_TICK: usize = 2;
+const PROVIDER_CODEX: u16 = 110;
+const PROVIDER_CLAUDE: u16 = 111;
+const CHECK_UPDATES: u16 = 112;
+const AUTO_UPDATES: u16 = 113;
+const INSTALL_UPDATE: u16 = 114;
+const UPDATE_STATUS: u16 = 115;
+const CONNECTION_STATUS: u16 = 116;
 const REFRESH: u16 = 101;
 const CONNECT: u16 = 102;
 const SETTINGS: u16 = 103;
@@ -166,8 +175,8 @@ unsafe fn panel_monitor(anchor: &RECT, fallback_dpi: u32) -> (RECT, u32) {
 }
 
 enum Command {
-    Refresh(Option<PathBuf>),
-    Connect(Option<PathBuf>),
+    Refresh(Provider, Option<PathBuf>),
+    Connect(Provider, Option<PathBuf>),
     CheckLogin,
     Stop,
 }
@@ -176,6 +185,7 @@ enum Update {
     SignedOut(bool),
     Error(String),
     OpenLogin(String),
+    ClaudeConnected,
     Pending,
 }
 struct Worker {
@@ -201,9 +211,12 @@ fn worker(hwnd: HWND) -> Worker {
             }
             let result: Result<Update, String> = (|| match command {
                 Command::Stop => Ok(Update::Pending),
-                Command::Refresh(path) => {
+                Command::Refresh(provider, path) => {
                     login = None;
                     login_started = None;
+                    if provider == Provider::Claude {
+                        return claude::read_limits().map(Update::Snapshot);
+                    }
                     let mut client = connect(path)?;
                     match client.read_account()? {
                         AccountStatus::SignedIn { .. } => {
@@ -213,7 +226,11 @@ fn worker(hwnd: HWND) -> Worker {
                         AccountStatus::ApiKey => Ok(Update::SignedOut(true)),
                     }
                 }
-                Command::Connect(path) => {
+                Command::Connect(provider, path) => {
+                    if provider == Provider::Claude {
+                        claude::connect()?;
+                        return Ok(Update::ClaudeConnected);
+                    }
                     let mut client = connect(path)?;
                     let url = client.start_login()?;
                     login = Some(client);
@@ -280,10 +297,17 @@ struct App {
     buttons: Vec<HWND>,
     icon: HICON,
     icon_key: String,
+    tray_added: bool,
     taskbar_created: u32,
     menu_keys: Vec<String>,
     label_texts: RefCell<Vec<String>>,
     last_render_second: u64,
+    claude_connected: bool,
+    update_rx: Option<Receiver<Result<Option<updater::PreparedUpdate>, String>>>,
+    update_ready: Option<updater::PreparedUpdate>,
+    installer_rx: Option<Receiver<Result<(), String>>>,
+    update_status: String,
+    next_update_check: Instant,
 }
 impl App {
     fn px(&self, n: i32) -> i32 {
@@ -314,8 +338,23 @@ impl App {
                 .as_ref()
                 .is_none_or(|s| s.is_stale(model::unix_now(), self.settings.poll_seconds()))
     }
+    fn primary_connect(&self) -> bool {
+        if self.demo {
+            return false;
+        }
+        match self.settings.provider {
+            Provider::Codex => self.signed_out,
+            Provider::Claude => !self.claude_connected,
+        }
+    }
     fn can_connect(&self) -> bool {
-        !self.busy && !self.login_pending && !self.demo && (!self.verified || self.error.is_some())
+        !self.busy
+            && !self.login_pending
+            && !self.demo
+            && match self.settings.provider {
+                Provider::Claude => !self.claude_connected,
+                Provider::Codex => !self.verified || self.error.is_some(),
+            }
     }
     fn send(&mut self, command: Command) {
         if self.busy || self.demo {
@@ -334,8 +373,59 @@ impl App {
         if self.login_pending {
             self.send(Command::CheckLogin);
         } else {
-            self.send(Command::Refresh(self.settings.codex_path.clone()));
+            self.send(Command::Refresh(
+                self.settings.provider,
+                self.settings.codex_path.clone(),
+            ));
         }
+    }
+    fn refresh_seconds(&self) -> u64 {
+        if self.settings.provider == Provider::Claude {
+            15
+        } else {
+            self.settings.poll_seconds()
+        }
+    }
+    fn check_updates(&mut self) {
+        if self.demo || self.update_rx.is_some() || self.update_ready.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel();
+        self.update_rx = Some(rx);
+        self.update_status = "Checking GitHub for updates…".into();
+        self.next_update_check = Instant::now() + updater::CHECK_INTERVAL;
+        let handle = self.hwnd.0 as isize;
+        thread::spawn(move || {
+            let _ = tx.send(updater::check_and_download());
+            unsafe {
+                let _ = PostMessageW(Some(HWND(handle as *mut _)), RESULT, WPARAM(0), LPARAM(0));
+            }
+        });
+    }
+    fn switch_provider(&mut self, provider: Provider) {
+        if self.busy || self.login_pending || self.settings.provider == provider {
+            return;
+        }
+        self.settings.provider = provider;
+        self.settings.selected_window = None;
+        self.claude_connected = !self.demo && claude::is_configured();
+        self.snapshot = if self.demo {
+            Some(demo_snapshot_for(provider))
+        } else {
+            match provider {
+                Provider::Codex => settings::load_cache().ok().flatten(),
+                Provider::Claude => claude::read_limits().ok(),
+            }
+        };
+        self.verified = self.demo;
+        self.signed_out = provider == Provider::Claude && !self.claude_connected;
+        self.error = None;
+        self.failures = 0;
+        self.status = format!("Connecting to {}…", provider.name());
+        self.icon_key.clear();
+        self.save_settings();
+        self.next_refresh = Instant::now();
+        self.refresh();
     }
     unsafe fn create_controls(&mut self) {
         unsafe {
@@ -448,14 +538,14 @@ impl App {
                     .as_ref()
                     .and_then(|s| s.plan())
                     .map(title_case)
-                    .unwrap_or_else(|| "Codex".into()),
+                    .unwrap_or_else(|| self.settings.provider.name().into()),
             );
             let selected = self.selected();
             self.set_label(
                 1,
                 selected
                     .map(|(pool, _)| pool.name.as_str())
-                    .unwrap_or("Codex"),
+                    .unwrap_or(self.settings.provider.name()),
             );
             self.set_label(
                 3,
@@ -480,6 +570,8 @@ impl App {
             );
             let hero_note = if self.stale() && self.snapshot.is_some() {
                 "Cached reading".into()
+            } else if self.settings.provider == Provider::Claude {
+                "Via Claude Code".into()
             } else if self.snapshot.is_some() {
                 format!("Every {} min", self.settings.poll_seconds() / 60)
             } else {
@@ -531,7 +623,45 @@ impl App {
                         }
                     }),
             );
-            self.set_label(13, "Extra credits");
+            if self.settings.provider == Provider::Claude {
+                let other = self
+                    .snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.pools.first())
+                    .and_then(|pool| {
+                        pool.windows.iter().find(|window| {
+                            Some(window.key.as_str()) != selected.map(|(_, w)| w.key.as_str())
+                        })
+                    });
+                self.set_label(
+                    10,
+                    &other
+                        .map(|w| w.duration_label())
+                        .unwrap_or_else(|| "Other window".into()),
+                );
+                self.set_label(
+                    11,
+                    &other
+                        .and_then(|w| w.remaining_percent())
+                        .map(|n| format!("{n}%"))
+                        .unwrap_or_else(|| "—".into()),
+                );
+                self.set_label(
+                    12,
+                    &other
+                        .filter(|w| w.resets_at.is_some())
+                        .map(|w| format!("Resets in {}", w.reset_countdown(now)))
+                        .unwrap_or_else(|| "Reset not reported".into()),
+                );
+            }
+            self.set_label(
+                13,
+                if self.settings.provider == Provider::Claude {
+                    "Source"
+                } else {
+                    "Extra credits"
+                },
+            );
             let balance = self
                 .snapshot
                 .as_ref()
@@ -547,7 +677,14 @@ impl App {
                     }
                 })
                 .unwrap_or_else(|| "—".into());
-            self.set_label(14, &balance);
+            self.set_label(
+                14,
+                if self.settings.provider == Provider::Claude {
+                    "Claude Code"
+                } else {
+                    &balance
+                },
+            );
             let status = if let Some(error) = &self.error {
                 error.clone()
             } else if self.busy {
@@ -558,6 +695,16 @@ impl App {
                 }
             } else if self.login_pending {
                 "Finish signing in in your browser.".into()
+            } else if self.installer_rx.is_some() {
+                "Preparing to restart for update…".into()
+            } else if let Some(update) = &self.update_ready {
+                format!("{} ready · Settings to restart", update.version)
+            } else if self.settings.provider == Provider::Claude
+                && self
+                    .selected()
+                    .is_none_or(|(_, w)| w.remaining_percent().is_none())
+            {
+                "Waiting for Claude Code usage".into()
             } else if let Some(s) = &self.snapshot {
                 let age = now.saturating_sub(s.fetched_at);
                 format!(
@@ -583,8 +730,12 @@ impl App {
             self.set_label(15, &status);
             let button = if self.login_pending {
                 "Signing in…"
-            } else if self.signed_out {
-                "Connect Codex"
+            } else if self.primary_connect() {
+                if self.settings.provider == Provider::Claude {
+                    "Connect Claude"
+                } else {
+                    "Connect Codex"
+                }
             } else {
                 "Refresh usage"
             };
@@ -619,8 +770,13 @@ impl App {
                     .map(|n| format!("{n}%"))
                     .unwrap_or_else(|| "?".into())
             };
-            let key = format!("{text}-{}-{}", self.dark, self.dpi);
-            if self.icon_key == key {
+            let key = format!(
+                "{text}-{}-{}-{}",
+                self.dark,
+                self.dpi,
+                self.settings.provider.name()
+            );
+            if self.icon_key == key && self.tray_added {
                 return;
             }
             if !self.icon.is_invalid() {
@@ -629,10 +785,12 @@ impl App {
             self.icon = ui_tray::make_icon(&text, self.dark, self.dpi);
             self.icon_key = key;
             let mut nid = self.nid();
-            nid.uFlags = NIF_TIP | NIF_ICON;
+            nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON | NIF_SHOWTIP;
+            nid.uCallbackMessage = TRAY;
             nid.hIcon = self.icon;
             let tip = wide(&format!(
-                "TokWatch\n{}{}",
+                "TokWatch · {}\n{}{}",
+                self.settings.provider.name(),
                 if unknown { "Last known: " } else { "" },
                 amount
                     .map(|n| format!("{n}% remaining"))
@@ -640,23 +798,19 @@ impl App {
             ));
             let length = tip.len().min(nid.szTip.len() - 1);
             nid.szTip[..length].copy_from_slice(&tip[..length]);
-            let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+            if self.tray_added {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &nid);
+            } else if Shell_NotifyIconW(NIM_ADD, &nid).as_bool() {
+                self.tray_added = true;
+                nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+                let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+            }
         }
     }
     unsafe fn add_tray(&mut self) {
+        self.tray_added = false;
+        self.icon_key.clear();
         unsafe {
-            if self.icon.is_invalid() {
-                self.icon = ui_tray::make_icon("?", self.dark, self.dpi);
-            }
-            let mut nid = self.nid();
-            nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
-            nid.uCallbackMessage = TRAY;
-            nid.hIcon = self.icon;
-            nid.szTip[..9].copy_from_slice(&wide("TokWatch")[..9]);
-            let _ = Shell_NotifyIconW(NIM_ADD, &nid);
-            nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
-            self.icon_key.clear();
             self.update_tray();
         }
     }
@@ -707,7 +861,7 @@ impl App {
             if pinned {
                 let _ = SetForegroundWindow(self.hwnd);
             }
-            SetTimer(Some(self.hwnd), HOVER, 250, None);
+            SetTimer(Some(self.hwnd), PANEL_TICK, 1000, None);
             self.render();
         }
     }
@@ -716,13 +870,35 @@ impl App {
             self.pinned = false;
             self.visible = false;
             let _ = ShowWindow(self.hwnd, SW_HIDE);
-            let _ = KillTimer(Some(self.hwnd), HOVER);
+            let _ = KillTimer(Some(self.hwnd), PANEL_TICK);
             ui_render::release();
         }
     }
     unsafe fn menu(&mut self) {
         unsafe {
             let Ok(menu) = CreatePopupMenu() else { return };
+            for (id, provider) in [
+                (PROVIDER_CODEX, Provider::Codex),
+                (PROVIDER_CLAUDE, Provider::Claude),
+            ] {
+                let flags = MF_STRING
+                    | if self.settings.provider == provider {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    }
+                    | if self.busy || self.login_pending {
+                        MF_GRAYED
+                    } else {
+                        MF_ENABLED
+                    };
+                let name = wide(match provider {
+                    Provider::Codex => "Monitor Codex",
+                    Provider::Claude => "Monitor Claude Code",
+                });
+                let _ = AppendMenuW(menu, flags, id as usize, PCWSTR(name.as_ptr()));
+            }
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
             let _ = AppendMenuW(menu, MF_STRING, REFRESH as usize, w!("Refresh now"));
             let _ = AppendMenuW(
                 menu,
@@ -733,9 +909,22 @@ impl App {
                         MF_GRAYED
                     },
                 CONNECT as usize,
-                w!("Connect to Codex…"),
+                PCWSTR(
+                    wide(if self.settings.provider == Provider::Claude {
+                        "Connect Claude Code…"
+                    } else {
+                        "Connect to Codex…"
+                    })
+                    .as_ptr(),
+                ),
             );
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                CONNECTION_STATUS as usize,
+                w!("Connection details…"),
+            );
             self.menu_keys.clear();
             if let Some(s) = &self.snapshot {
                 let selected = self.selected().map(|(_, w)| w.key.clone());
@@ -762,7 +951,11 @@ impl App {
                 }
             }
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
-            for (i, seconds) in [60u64, 120, 300, 600].iter().enumerate() {
+            for (i, seconds) in [60u64, 120, 300, 600]
+                .iter()
+                .enumerate()
+                .filter(|_| self.settings.provider == Provider::Codex)
+            {
                 let name = wide(&format!("Refresh every {} min", seconds / 60));
                 let flags = MF_STRING
                     | if self.settings.poll_seconds() == *seconds {
@@ -790,7 +983,7 @@ impl App {
                 w!("Start with Windows"),
             );
             let path_flags = MF_STRING
-                | if self.busy || self.login_pending {
+                | if self.busy || self.login_pending || self.settings.provider != Provider::Codex {
                     MF_GRAYED
                 } else {
                     MF_ENABLED
@@ -812,6 +1005,49 @@ impl App {
                 MF_STRING,
                 OPEN_FOLDER as usize,
                 w!("Open settings folder"),
+            );
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            let update_text = if self.update_rx.is_some() {
+                "Checking for updates…"
+            } else {
+                "Check for updates"
+            };
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.update_rx.is_some() || self.demo {
+                        MF_GRAYED
+                    } else {
+                        MF_ENABLED
+                    },
+                CHECK_UPDATES as usize,
+                PCWSTR(wide(update_text).as_ptr()),
+            );
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING
+                    | if self.settings.automatic_updates {
+                        MF_CHECKED
+                    } else {
+                        MF_UNCHECKED
+                    },
+                AUTO_UPDATES as usize,
+                w!("Automatic updates"),
+            );
+            if let Some(update) = &self.update_ready {
+                let name = wide(&format!("Restart to update to {}", update.version));
+                let _ = AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    INSTALL_UPDATE as usize,
+                    PCWSTR(name.as_ptr()),
+                );
+            }
+            let _ = AppendMenuW(
+                menu,
+                MF_STRING,
+                UPDATE_STATUS as usize,
+                w!("Update status…"),
             );
             let _ = AppendMenuW(menu, MF_STRING, ABOUT as usize, w!("About TokWatch"));
             let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
@@ -839,7 +1075,7 @@ impl App {
         unsafe {
             match id {
                 REFRESH => {
-                    if self.signed_out {
+                    if self.primary_connect() {
                         self.command(CONNECT);
                     } else {
                         self.refresh();
@@ -850,11 +1086,68 @@ impl App {
                         self.verified = false;
                         self.snapshot = None;
                         self.error = None;
-                        let _ = settings::clear_cache();
-                        self.send(Command::Connect(self.settings.codex_path.clone()));
+                        if self.settings.provider == Provider::Codex {
+                            let _ = settings::clear_cache();
+                        }
+                        self.send(Command::Connect(
+                            self.settings.provider,
+                            self.settings.codex_path.clone(),
+                        ));
                     }
                 }
                 SETTINGS => self.menu(),
+                PROVIDER_CODEX => self.switch_provider(Provider::Codex),
+                PROVIDER_CLAUDE => self.switch_provider(Provider::Claude),
+                CONNECTION_STATUS => {
+                    let details = if let Some(error) = &self.error {
+                        error.clone()
+                    } else if self.settings.provider == Provider::Claude {
+                        "Claude subscription allowance comes from Claude Code's local status line. Connect Claude Code, then use a Pro or Max session. Readings update during Claude Code sessions; TokWatch checks the local feed every 15 seconds. Existing custom status lines are preserved.".into()
+                    } else {
+                        self.status.clone()
+                    };
+                    let _ = MessageBoxW(
+                        Some(self.hwnd),
+                        PCWSTR(wide(&details).as_ptr()),
+                        w!("TokWatch connection"),
+                        MB_OK,
+                    );
+                }
+                CHECK_UPDATES => self.check_updates(),
+                AUTO_UPDATES => {
+                    self.settings.automatic_updates = !self.settings.automatic_updates;
+                    self.save_settings();
+                    if self.settings.automatic_updates {
+                        self.check_updates();
+                    }
+                }
+                UPDATE_STATUS => {
+                    let details = wide(&self.update_status);
+                    let _ = MessageBoxW(
+                        Some(self.hwnd),
+                        PCWSTR(details.as_ptr()),
+                        w!("TokWatch updates"),
+                        MB_OK,
+                    );
+                }
+                INSTALL_UPDATE => {
+                    if !self.demo && self.installer_rx.is_none() {
+                        if let Some(update) = self.update_ready.clone() {
+                            let (tx, rx) = mpsc::channel();
+                            self.installer_rx = Some(rx);
+                            let handle = self.hwnd.0 as isize;
+                            thread::spawn(move || {
+                                let _ = tx.send(updater::launch_installer(&update));
+                                let _ = PostMessageW(
+                                    Some(HWND(handle as *mut _)),
+                                    RESULT,
+                                    WPARAM(0),
+                                    LPARAM(0),
+                                );
+                            });
+                        }
+                    }
+                }
                 STARTUP => {
                     if let Err(e) = set_startup(!startup_enabled()) {
                         self.error = Some(e);
@@ -902,7 +1195,7 @@ impl App {
                     let _ = MessageBoxW(
                         Some(self.hwnd),
                         w!(
-                            "TokWatch 0.1.0\n\nNative Windows monitor for Codex usage.\nRust + Win32. Account data stays local.\n\nUsage is a percentage of your allowance, not an exact token balance.\nRequires a compatible signed-in Codex installation.\n\nHover for details. Click to keep open. Escape to dismiss."
+                            "TokWatch 0.2.0\n\nNative Windows monitor for Codex and Claude allowance.\nRust + Win32. Account readings stay local.\n\nCodex uses its official helper. Claude uses its local Claude Code status line.\n\nClick for details. Escape to dismiss.\nGitHub updates are verified before installation."
                         ),
                         w!("About TokWatch"),
                         MB_OK,
@@ -921,7 +1214,7 @@ impl App {
                 n if (INTERVAL_BASE..INTERVAL_BASE + 4).contains(&n) => {
                     self.settings.poll_seconds = [60, 120, 300, 600][(n - INTERVAL_BASE) as usize];
                     self.next_refresh =
-                        Instant::now() + Duration::from_secs(self.settings.poll_seconds());
+                        Instant::now() + Duration::from_secs(self.refresh_seconds());
                     self.save_settings();
                 }
                 _ => {}
@@ -930,6 +1223,9 @@ impl App {
         }
     }
     fn save_settings(&mut self) {
+        if self.demo {
+            return;
+        }
         if let Err(e) = self.settings.save() {
             self.error = Some(e);
         }
@@ -945,12 +1241,21 @@ impl App {
                         self.verified = true;
                         self.error = None;
                         self.failures = 0;
-                        if let Err(e) = settings::save_cache(&snapshot) {
-                            self.error = Some(e);
+                        if self.settings.provider == Provider::Codex {
+                            if let Err(e) = settings::save_cache(&snapshot) {
+                                self.error = Some(e);
+                            }
                         }
                         self.snapshot = Some(snapshot);
                         self.next_refresh =
-                            Instant::now() + Duration::from_secs(self.settings.poll_seconds());
+                            Instant::now() + Duration::from_secs(self.refresh_seconds());
+                    }
+                    Update::ClaudeConnected => {
+                        self.claude_connected = true;
+                        self.signed_out = false;
+                        self.error = None;
+                        self.status = "Use Claude Code to load allowance.".into();
+                        self.next_refresh = Instant::now() + Duration::from_secs(15);
                     }
                     Update::SignedOut(api) => {
                         self.signed_out = true;
@@ -966,18 +1271,20 @@ impl App {
                         }
                         .into();
                         self.next_refresh =
-                            Instant::now() + Duration::from_secs(self.settings.poll_seconds());
+                            Instant::now() + Duration::from_secs(self.refresh_seconds());
                     }
                     Update::Error(e) => {
                         self.error = Some(e);
                         self.login_pending = false;
                         self.failures = self.failures.saturating_add(1);
                         self.next_refresh = Instant::now()
-                            + Duration::from_secs(
+                            + Duration::from_secs(if self.settings.provider == Provider::Claude {
+                                15
+                            } else {
                                 (self.settings.poll_seconds()
                                     * 2u64.saturating_pow(self.failures.min(4)))
-                                .min(1800),
-                            );
+                                .min(1800)
+                            });
                     }
                     Update::OpenLogin(url) => {
                         self.error = None;
@@ -990,6 +1297,54 @@ impl App {
                     Update::Pending => {
                         self.next_refresh = Instant::now() + Duration::from_secs(5);
                     }
+                }
+            }
+            let install = self
+                .installer_rx
+                .as_ref()
+                .and_then(|rx| match rx.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                        "The installer could not start. Try Restart to update again.".into(),
+                    )),
+                    Err(mpsc::TryRecvError::Empty) => None,
+                });
+            if let Some(result) = install {
+                self.installer_rx = None;
+                match result {
+                    Ok(()) => {
+                        let _ = DestroyWindow(self.hwnd);
+                        return;
+                    }
+                    Err(error) => {
+                        self.update_ready = None;
+                        self.update_status = error;
+                        self.command(UPDATE_STATUS);
+                    }
+                }
+            }
+            let update = self.update_rx.as_ref().and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                    "The update worker stopped. Check for updates again.".into(),
+                )),
+                Err(mpsc::TryRecvError::Empty) => None,
+            });
+            if let Some(result) = update {
+                self.update_rx = None;
+                match result {
+                    Ok(Some(ready)) => {
+                        self.update_status = format!(
+                            "{} has been downloaded and verified. Choose Restart to update in Settings.",
+                            ready.version
+                        );
+                        self.update_ready = Some(ready);
+                    }
+                    Ok(None) => {
+                        self.update_status =
+                            format!("TokWatch {} is up to date.", env!("CARGO_PKG_VERSION"))
+                    }
+                    Err(error) => self.update_status = error,
                 }
             }
             self.render();
@@ -1110,7 +1465,7 @@ unsafe fn new_host(
             settings,
             snapshot,
             verified: demo,
-            status: "Connecting to Codex…".into(),
+            status: "Waiting for an allowance reading…".into(),
             error: setting_error,
             busy: false,
             login_pending: false,
@@ -1130,10 +1485,22 @@ unsafe fn new_host(
             buttons: Vec::new(),
             icon: HICON::default(),
             icon_key: String::new(),
+            tray_added: false,
             taskbar_created: RegisterWindowMessageW(w!("TaskbarCreated")),
             menu_keys: Vec::new(),
             label_texts: RefCell::new(Vec::new()),
             last_render_second: 0,
+            claude_connected: !demo && claude::is_configured(),
+            update_rx: None,
+            update_ready: None,
+            installer_rx: None,
+            update_status: if demo {
+                "Updates are disabled in demo mode.".into()
+            } else {
+                updater::read_install_error()
+                    .unwrap_or_else(|| "Updates have not been checked yet.".into())
+            },
+            next_update_check: Instant::now(),
         };
         let theme = PaintTheme::from_app(&app);
         let taskbar_created = app.taskbar_created;
@@ -1174,7 +1541,7 @@ pub fn run() {
         let hwnd = match CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             w!("TokWatch.Native.Window"),
-            w!("TokWatch — Codex usage"),
+            w!("TokWatch — usage"),
             WS_POPUP | WS_BORDER | WS_CLIPCHILDREN,
             0,
             0,
@@ -1199,15 +1566,22 @@ pub fn run() {
                 return;
             }
         };
-        let (settings, setting_error) = match Settings::load() {
+        let (mut settings, setting_error) = match Settings::load() {
             Ok(s) => (s, None),
             Err(e) => (Settings::default(), Some(e)),
         };
-        let demo = std::env::args().any(|s| s == "--demo");
+        let demo_claude = std::env::args().any(|s| s == "--demo-claude");
+        let demo = demo_claude || std::env::args().any(|s| s == "--demo");
+        if demo_claude {
+            settings.provider = Provider::Claude;
+        }
         let snapshot = if demo {
-            Some(demo_snapshot())
+            Some(demo_snapshot_for(settings.provider))
         } else {
-            settings::load_cache().ok().flatten()
+            match settings.provider {
+                Provider::Codex => settings::load_cache().ok().flatten(),
+                Provider::Claude => claude::read_limits().ok(),
+            }
         };
         let host = new_host(hwnd, settings, snapshot, demo, setting_error);
         apply_window_style(hwnd, host.app.borrow().dark);
@@ -1451,13 +1825,9 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
             return LRESULT(0);
         }
         match message {
-            SHOW_PANEL => {
-                app.show(true);
-                LRESULT(0)
-            }
             TRAY => {
                 match lparam.0 as u32 & 0xffff {
-                    NIN_POPUPOPEN => app.show(false),
+                    NIN_POPUPOPEN | NIN_POPUPCLOSE => {}
                     NIN_SELECT | NIN_KEYSELECT => {
                         if app.visible && app.pinned {
                             app.hide();
@@ -1480,28 +1850,21 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
             }
             WM_TIMER => {
                 if wparam.0 == TICK {
+                    app.update_tray();
+                    if !app.demo
+                        && app.settings.automatic_updates
+                        && Instant::now() >= app.next_update_check
+                    {
+                        app.check_updates();
+                    }
                     if !app.demo && Instant::now() >= app.next_refresh {
                         app.refresh();
                     }
-                    if !app.visible {
-                        app.update_tray();
-                    }
-                } else if wparam.0 == HOVER {
-                    if !app.pinned {
-                        let mut p = POINT::default();
-                        let _ = GetCursorPos(&mut p);
-                        let mut rect = RECT::default();
-                        let _ = GetWindowRect(hwnd, &mut rect);
-                        let inside = |r: RECT| {
-                            p.x >= r.left && p.x <= r.right && p.y >= r.top && p.y <= r.bottom
-                        };
-                        if !inside(rect) && !tray_rect(hwnd).is_some_and(inside) {
-                            app.hide();
-                        }
-                    }
-                    if app.visible && app.last_render_second != model::unix_now() {
-                        app.render();
-                    }
+                } else if wparam.0 == PANEL_TICK
+                    && app.visible
+                    && app.last_render_second != model::unix_now()
+                {
+                    app.render();
                 }
                 LRESULT(0)
             }
@@ -1624,7 +1987,7 @@ unsafe extern "system" fn button_proc(
         DefSubclassProc(hwnd, message, wparam, lparam)
     }
 }
-fn apply_window_style(hwnd: HWND, dark: bool) {
+fn apply_window_style(hwnd: HWND, _dark: bool) {
     unsafe {
         let round = DWMWCP_ROUND;
         let _ = DwmSetWindowAttribute(
@@ -1633,14 +1996,14 @@ fn apply_window_style(hwnd: HWND, dark: bool) {
             &round as *const _ as *const _,
             std::mem::size_of_val(&round) as u32,
         );
-        let mode = BOOL::from(dark);
+        let mode = BOOL::from(true);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &mode as *const _ as *const _,
             std::mem::size_of_val(&mode) as u32,
         );
-        let border = ui_style::palette(dark).border;
+        let border = ui_style::palette(true).border;
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_BORDER_COLOR,
@@ -1811,6 +2174,38 @@ fn local_date(timestamp: u64) -> String {
             "{:04}-{:02}-{:02} at {:02}:{:02} (local)",
             time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute
         )
+    }
+}
+fn demo_snapshot_for(provider: Provider) -> UsageSnapshot {
+    if provider == Provider::Codex {
+        return demo_snapshot();
+    }
+    let now = model::unix_now();
+    UsageSnapshot {
+        fetched_at: now,
+        pools: vec![model::UsagePool {
+            id: "claude".into(),
+            name: "Claude".into(),
+            plan: None,
+            credits: None,
+            windows: vec![
+                model::UsageWindow {
+                    key: "claude:five_hour".into(),
+                    kind: "five_hour".into(),
+                    used_percent: Some(28.0),
+                    duration_mins: Some(300),
+                    resets_at: Some(now + 9000),
+                },
+                model::UsageWindow {
+                    key: "claude:seven_day".into(),
+                    kind: "seven_day".into(),
+                    used_percent: Some(14.0),
+                    duration_mins: Some(10080),
+                    resets_at: Some(now + 345600),
+                },
+            ],
+        }],
+        reset_credits: None,
     }
 }
 fn demo_snapshot() -> UsageSnapshot {

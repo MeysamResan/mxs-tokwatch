@@ -5,10 +5,30 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Provider {
+    Claude,
+    #[default]
+    #[serde(other)]
+    Codex,
+}
+
+impl Provider {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Codex => "Codex",
+            Self::Claude => "Claude",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Settings {
     pub poll_seconds: u64,
+    pub provider: Provider,
+    pub automatic_updates: bool,
     pub codex_path: Option<PathBuf>,
     /// A stable key such as "codex:primary"; None selects automatically.
     pub selected_window: Option<String>,
@@ -18,6 +38,8 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             poll_seconds: 120,
+            provider: Provider::Codex,
+            automatic_updates: true,
             codex_path: None,
             selected_window: None,
         }
@@ -149,6 +171,8 @@ mod tests {
     fn older_settings_receive_defaults_and_polling_is_bounded() {
         let settings: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.poll_seconds(), 120);
+        assert_eq!(settings.provider, Provider::Codex);
+        assert!(settings.automatic_updates);
         let low: Settings = serde_json::from_str(r#"{"poll_seconds":0}"#).unwrap();
         assert_eq!(low.normalized().poll_seconds, 60);
         let high: Settings =
