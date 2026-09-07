@@ -1,12 +1,12 @@
 # TokWatch
 
-A native Windows 11 system tray app for monitoring your Codex usage allowance. Built with Rust and Win32, with a number beside the clock and a modern, compact details panel on hover.
+A native Windows 11 system tray app for monitoring your Codex usage allowance. Built with Rust and Win32, with the remaining percentage beside the clock and a compact details panel on hover.
 
 Codex provides allowance percentages. TokWatch displays the percentage remaining; it does not estimate an exact token balance.
 
 ## What it shows
 
-- Remaining allowance for the selected Codex usage window.
+- Remaining allowance inside a circular tray gauge, including the full percentage such as `14%`. The digits stay proportional, with a smaller percent suffix for legibility.
 - Time until its scheduled reset, plus the reset date in local time.
 - Available full resets and the earliest expiry reported by Codex.
 - Account plan, extra-credit balance, and other usage windows when available.
@@ -16,17 +16,23 @@ You can choose the usage window and refresh every 1, 2, 5, or 10 minutes. The de
 
 ## Native interface
 
-The panel puts the remaining percentage and usage meter in a large card, with separate cards for the reset countdown and available full resets. A compact plan badge, credit details, and connection status keep the supporting information easy to scan.
+The tray ring shows how much allowance remains. Green means more than 50%, amber means 21�50%, and red means 20% or less. Unknown or stale readings use a neutral ring and `?`. The same thresholds apply to the panel meter. The icon is drawn at the current Windows tray size with smooth edges; the ring and center readout update only when the value, theme, or scale changes.
 
-The interface follows the Windows light or dark theme automatically. Segoe UI text, rounded cards, a mint accent, and a Windows 11 rounded window give it a consistent native appearance. The panel is 420 by 560 logical pixels and scales with the display, reducing its scale when needed to fit the available screen area.
+The panel puts the remaining percentage and usage meter in one compact card. Two stat columns below it show the reset countdown and available full resets. A small plan badge, credit row, connection status, and two actions keep the details together without extra card padding.
 
-Labels and buttons remain native Windows controls. Buttons use custom drawing for their appearance while retaining accessible names, keyboard navigation, visible focus, and disabled states. The primary action changes from **Refresh** to **Connect to Codex** when a connection is needed.
+The interface follows the Windows light or dark theme automatically. Segoe UI text, rounded surfaces, a mint accent, and a Windows 11 rounded window give it a consistent native appearance. The panel is 320 by 320 logical pixels, using about 56% less area than the previous 420 by 560 panel. It scales with the display and reduces its scale when needed to fit the available screen area.
+
+Direct2D draws antialiased curves, and DirectWrite draws grayscale-antialiased text at the actual display resolution. Fractional font sizes preserve smooth scaling without stretching a panel bitmap. Windows graphics and font resources are cached on the UI thread while the panel is open and released when it closes; there is no extra UI runtime or continuous rendering loop.
+
+Labels and buttons remain native Windows controls with custom drawing and accessible names. Buttons retain keyboard navigation, visible focus, and disabled states. The primary action changes from **Refresh** to **Connect to Codex** when a connection is needed.
 
 ## Run
 
 Requirements: Windows 11 x64 and a compatible native Codex installation with a ChatGPT account sign-in. Rust is required to build TokWatch, but not to run the resulting executable.
 
-Build the project using the instructions below, then run:
+Download the [Windows x64 portable ZIP](https://github.com/MeysamResan/mxs-tokwatch/releases/download/v0.1.0/TokWatch-v0.1.0-windows-x64.zip) from the [v0.1.0 preview release](https://github.com/MeysamResan/mxs-tokwatch/releases/tag/v0.1.0), extract it into a permanent folder, and run **TokWatch.exe**. The ZIP includes the executable, quick-start instructions, and MIT license. This preview is unsigned.
+
+To build from source instead, use the instructions below, then run:
 
 ```powershell
 .\target\release\tokwatch.exe
@@ -34,7 +40,7 @@ Build the project using the instructions below, then run:
 
 For the private local toolchain, the build output is `target\x86_64-pc-windows-gnullvm\release\tokwatch.exe`. A prepared portable copy in `dist\TokWatch.exe` can also be run directly.
 
-TokWatch starts in the system tray. Windows may initially place it in the tray overflow; move its icon beside the clock to keep the number visible.
+TokWatch starts in the system tray. Windows may initially place it in the tray overflow; move its icon beside the clock to keep the percentage visible.
 
 | Action | Behavior |
 | --- | --- |
@@ -106,13 +112,27 @@ Individual tasks are available:
 
 `-Configuration Debug` selects a debug build; `-Target` accepts an explicit Rust target. If the private project-local Rust and LLVM toolchains exist under `.tools`, the script uses them with temporary process environment settings and selects `x86_64-pc-windows-gnullvm`. Its executable is `target\x86_64-pc-windows-gnullvm\release\tokwatch.exe`. Otherwise it uses Cargo from PATH. `.tools` is ignored by Git and is not required by the application or included in the source distribution.
 
-The ordinary tests do not require a Codex account. They include native control layout checks at 100%, 150%, and 200% display scaling in both light and dark themes, missing and long account metadata, accessible button names, and nested Windows callbacks. An explicitly ignored integration test can perform real, read-only account requests through an installed and signed-in Codex helper:
+The ordinary tests do not require a Codex account. They include 30 native layout combinations at 100%, 125%, 150%, 175%, and 200% display scaling in both light and dark themes with normal, missing, and long account metadata. Checks use actual DirectWrite text metrics, retain accessible control names and keyboard focus, and cover nested Windows callbacks. Rendering checks produce 12 panel captures and exercise 48 tray variants at native 16, 20, 24, and 32 pixel sizes. An explicitly ignored integration test can perform real, read-only account requests through an installed and signed-in Codex helper:
 
 ```powershell
 cargo test live_read -- --ignored --nocapture
 ```
 
 See [architecture and behavior](docs/architecture.md) for protocol handling and resource details.
+
+## Prepare a portable release
+
+Build, verify, and package a local Windows x64 release with:
+
+```powershell
+.\scripts\package.ps1
+```
+
+The helper runs `scripts/build.ps1 -Task Verify -Configuration Release` and writes the executable, quick-start README, MIT license, portable ZIP, and SHA-256 checksums to `dist\v0.1.0`. The ZIP is `TokWatch-v0.1.0-windows-x64.zip`; extract it into a permanent folder and run `TokWatch.exe`. No Rust toolchain is required to run it.
+
+The package is an unsigned preview. The script checks the executable architecture and refuses to replace different artifacts unless you explicitly use `-Force`. It supports `-Target` for an x64 Windows Rust target. Output folders remain ignored by Git, and packaging does not commit, upload, or publish anything.
+
+See the [v0.1.0 release notes](docs/releases/v0.1.0.md) and [prepared GitHub description, topics, and manual release steps](docs/github-release.md). A release tag must point to a commit containing the complete tested source, including any source files that were uncommitted when the executable was built.
 
 ## Local data and removal
 
@@ -127,11 +147,11 @@ To remove the app, turn off **Start with Windows**, exit TokWatch, and delete it
 The Windows x64 release was built and run locally on September 7, 2026.
 
 - Formatting and strict Clippy checks passed.
-- 21 automated tests passed, covering native layout in both themes at 100%, 150%, and 200% scaling, missing and long account metadata, accessible button names, bounded callback deferral, protocol handling, and cache behavior.
+- The release executable is 653312 bytes and imports only Windows system DLLs.
+- 24 automated tests passed, covering 30 native layout combinations at 100%, 125%, 150%, 175%, and 200% scaling, both themes, normal/missing/long account metadata, DirectWrite text fit, accessible controls, bounded callback deferral, protocol handling, and cache behavior.
+- Rendering checks produced 12 panel captures and exercised 48 percentage-icon variants at native 16, 20, 24, and 32 pixel sizes.
 - A separate live account test reused the existing ChatGPT sign-in, fetched usage and reset details, and confirmed the helper was reaped.
 - The running tray app fetched two usage pools and two available resets.
-- The executable is 639488 bytes (about 624 KiB) and imports only Windows system DLLs.
-- One 106.6-second sample of the running app showed 27.15 MiB working set, 3.86 MiB private memory, and 531.25 ms additional CPU time. No Codex helper was resident at the measurement. These are local observations, not resource guarantees.
 
 A Codex helper temporarily adds memory and CPU work during a refresh; normal refreshes release it afterward. Resource measurements depend on the build, Windows configuration, and Codex installation.
 

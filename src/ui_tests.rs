@@ -26,6 +26,9 @@ impl Fixture {
             .unwrap(),
             Self::Long => {
                 let mut snapshot = demo_snapshot();
+                for window in &mut snapshot.pools[0].windows {
+                    window.used_percent = Some(0.0);
+                }
                 snapshot.pools[0].name =
                     "Codex usage with a very long descriptive account allowance name ".repeat(2);
                 snapshot.pools[0].plan =
@@ -50,7 +53,7 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
             lpszClassName: name,
             ..Default::default()
         });
-        for dpi in [96u32, 144, 192] {
+        for dpi in [96u32, 120, 144, 168, 192] {
             for dark in [false, true] {
                 for fixture in [Fixture::Normal, Fixture::Missing, Fixture::Long] {
                     let hwnd = CreateWindowExW(
@@ -60,8 +63,8 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                         WS_POPUP | WS_CLIPCHILDREN,
                         160,
                         120,
-                        420 * dpi as i32 / 96,
-                        560 * dpi as i32 / 96,
+                        PANEL_WIDTH * dpi as i32 / 96,
+                        PANEL_HEIGHT * dpi as i32 / 96,
                         None,
                         None,
                         Some(instance.into()),
@@ -99,7 +102,7 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                         assert_eq!(app.buttons.len(), 2);
                         verify_control_bounds(app, dpi, dark, fixture);
                         verify_text_layout(app, dpi, dark, fixture);
-                        verify_button_semantics(app);
+                        verify_control_semantics(app);
                         match fixture {
                             Fixture::Normal => {
                                 assert_eq!(label_text(app.labels[4]), "26%");
@@ -109,13 +112,15 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                                 assert_eq!(label_text(app.labels[4]), "—");
                                 assert_eq!(label_text(app.labels[11]), "—");
                             }
-                            Fixture::Long => {}
+                            Fixture::Long => {
+                                assert_eq!(label_text(app.labels[4]), "100%");
+                            }
                         }
                     }
                     host.flush(hwnd);
-                    // Six representative screenshots; all 18 configurations
-                    // above are measured using the actual Windows font metrics.
-                    if dpi == 96 {
+                    // Capture both native and fractional-scale renderings. All 30
+                    // configurations use the renderer's actual DirectWrite metrics.
+                    if matches!(dpi, 96 | 144) {
                         capture_test_panel(hwnd, &host, dark, fixture);
                     }
                     destroy_test_panel(hwnd, &host);
@@ -172,53 +177,60 @@ unsafe fn verify_control_bounds(app: &App, dpi: u32, dark: bool, fixture: Fixtur
 
 unsafe fn verify_text_layout(app: &App, dpi: u32, dark: bool, fixture: Fixture) {
     unsafe {
-        let dc = GetDC(Some(app.hwnd));
+        // Measure with the same fractional physical font size used for rendering.
+        // Allow only one physical pixel for integer native window bounds.
+        let scale = dpi as f32 / 96.0;
+        let tolerance = 1.0;
         for (index, hwnd) in app.labels.iter().enumerate() {
             let text = label_text(*hwnd);
-            let mut utf16: Vec<u16> = text.encode_utf16().collect();
-            let font = HFONT(SendMessageW(*hwnd, WM_GETFONT, None, None).0 as *mut _);
-            assert!(!font.is_invalid(), "label {index} has no native font");
-            let previous = SelectObject(dc, font.into());
-            let mut extent = SIZE::default();
-            assert!(GetTextExtentPoint32W(dc, &utf16, &mut extent).as_bool());
+            let (size, weight) = FONT_SPECS[LABEL_SPECS[index].4];
+            let extent = ui_render::measure_text(&text, size as f32 * scale, weight as u16)
+                .expect("DirectWrite text measurement must be available");
             let mut rect = RECT::default();
             GetClientRect(*hwnd, &mut rect).unwrap();
-            let style = GetWindowLongPtrW(*hwnd, GWL_STYLE) as u32;
-            // SS_ENDELLIPSIS is 0x4000. Windows exposes this flag in a
-            // separate module; querying the real native style avoids drawing
-            // an arbitrary long server-provided string outside its card.
-            let ellipsis = style & 0x4000 != 0;
-            if index == 15 && !ellipsis {
-                let mut measured = rect;
-                DrawTextW(
-                    dc,
-                    &mut utf16,
-                    &mut measured,
-                    DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
-                );
-                assert!(
-                    measured.bottom <= rect.bottom,
-                    "status clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' {measured:?} vs {rect:?}"
-                );
-            } else {
-                assert!(
-                    extent.cy <= rect.bottom,
-                    "label {index} vertically clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' {extent:?} vs {rect:?}"
-                );
-                let external_metadata = matches!(index, 2 | 3 | 6 | 9 | 12 | 14 | 15);
-                assert!(
-                    extent.cx <= rect.right || (external_metadata && ellipsis),
-                    "label {index} horizontally clipped without ellipsis at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' {extent:?} vs {rect:?}"
-                );
-            }
-            SelectObject(dc, previous);
+            let width = rect.right as f32;
+            let height = rect.bottom as f32;
+            assert!(
+                extent.height <= height + tolerance,
+                "label {index} vertically clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' height {} vs {height}",
+                extent.height
+            );
+            let external_metadata = matches!(index, 1 | 2 | 3 | 6 | 9 | 12 | 14 | 15);
+            assert!(
+                extent.width <= width + tolerance || external_metadata,
+                "label {index} horizontally clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' width {} vs {width}",
+                extent.width
+            );
         }
-        ReleaseDC(Some(app.hwnd), dc);
+        for hwnd in &app.buttons {
+            let text = label_text(*hwnd);
+            let extent = ui_render::measure_text(&text, 12.0 * scale, 400)
+                .expect("DirectWrite button text measurement must be available");
+            let mut rect = RECT::default();
+            GetClientRect(*hwnd, &mut rect).unwrap();
+            assert!(
+                extent.width + 16.0 * scale <= rect.right as f32 + tolerance
+                    && extent.height <= rect.bottom as f32 + tolerance,
+                "button text does not fit at {dpi} DPI: '{text}'"
+            );
+        }
     }
 }
 
-unsafe fn verify_button_semantics(app: &App) {
+unsafe fn verify_control_semantics(app: &App) {
     unsafe {
+        for (index, label) in app.labels.iter().enumerate() {
+            let style = GetWindowLongPtrW(*label, GWL_STYLE) as u32;
+            assert_eq!(
+                style & 0x1f,
+                13,
+                "label {index} must use DirectWrite owner drawing"
+            );
+            assert!(
+                !label_text(*label).is_empty(),
+                "label {index} is missing its native accessible name"
+            );
+        }
         for (button, expected_id) in app.buttons.iter().zip([REFRESH, SETTINGS]) {
             assert_eq!(GetDlgCtrlID(*button), expected_id as i32);
             let style = GetWindowLongPtrW(*button, GWL_STYLE) as u32;
@@ -304,6 +316,7 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
         );
         let _ = GdiFlush();
         let data = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
+        verify_smoothed_card_corner(data, width, host.app.borrow().panel_dpi, dark);
         let mut bmp = Vec::new();
         bmp.extend_from_slice(b"BM");
         bmp.extend_from_slice(&(54 + data.len() as u32).to_le_bytes());
@@ -322,7 +335,15 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
         std::fs::create_dir_all(&directory).unwrap();
         let theme = if dark { "dark" } else { "light" };
         std::fs::write(
-            directory.join(format!("native-panel-{theme}-{}.bmp", fixture.name())),
+            directory.join(if host.app.borrow().panel_dpi == 96 {
+                format!("native-panel-{theme}-{}.bmp", fixture.name())
+            } else {
+                format!(
+                    "native-panel-{theme}-{}-{}pct.bmp",
+                    fixture.name(),
+                    host.app.borrow().panel_dpi * 100 / 96
+                )
+            }),
             bmp,
         )
         .unwrap();
@@ -330,6 +351,31 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
         let _ = DeleteObject(bitmap.into());
         let _ = DeleteDC(dc);
     }
+}
+
+fn verify_smoothed_card_corner(pixels: &[u8], width: i32, dpi: u32, dark: bool) {
+    let colors = ui_style::palette(dark);
+    let solid_colors = [colors.bg.0, colors.surface.0, colors.border.0];
+    let scale = |value: i32| value * dpi as i32 / 96;
+    let mut blended_pixels = 0;
+    // This part of the hero's rounded corner contains no native child controls.
+    // Aliased GDI geometry can produce only the three solid palette colors;
+    // the Direct2D edge must contain intermediate coverage values.
+    for y in scale(50)..scale(62) {
+        for x in scale(12)..scale(24) {
+            let offset = ((y * width + x) * 4) as usize;
+            let color = pixels[offset + 2] as u32
+                | ((pixels[offset + 1] as u32) << 8)
+                | ((pixels[offset] as u32) << 16);
+            if !solid_colors.contains(&color) {
+                blended_pixels += 1;
+            }
+        }
+    }
+    assert!(
+        blended_pixels >= 4,
+        "the rounded panel edge was not antialiased at {dpi} DPI (dark={dark})"
+    );
 }
 
 #[test]
@@ -358,8 +404,8 @@ fn nested_callbacks_are_deferred_without_borrow_panics() {
             WS_POPUP,
             0,
             0,
-            420,
-            560,
+            PANEL_WIDTH,
+            PANEL_HEIGHT,
             None,
             None,
             Some(instance.into()),

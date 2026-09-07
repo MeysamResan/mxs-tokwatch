@@ -17,7 +17,7 @@ use windows::{
         System::{
             LibraryLoader::GetModuleHandleW,
             Registry::*,
-            SystemServices::{SS_CENTER, SS_ENDELLIPSIS, SS_LEFT, SS_NOPREFIX, SS_RIGHT},
+            SystemServices::{SS_ENDELLIPSIS, SS_NOPREFIX, SS_OWNERDRAW},
             Threading::*,
             Time::*,
         },
@@ -31,10 +31,33 @@ use windows::{
     },
     core::{BOOL, PCWSTR, w},
 };
+#[path = "ui_render.rs"]
+mod ui_render;
 #[path = "ui_style.rs"]
 mod ui_style;
-const PANEL_WIDTH: i32 = 420;
-const PANEL_HEIGHT: i32 = 560;
+#[path = "ui_tray.rs"]
+mod ui_tray;
+const PANEL_WIDTH: i32 = 320;
+const PANEL_HEIGHT: i32 = 320;
+const FONT_SPECS: [(i32, i32); 5] = [(16, 600), (12, 400), (40, 600), (20, 600), (11, 500)];
+const LABEL_SPECS: [(i32, i32, i32, i32, usize); 16] = [
+    (46, 14, 180, 22, 0),
+    (24, 59, 181, 17, 1),
+    (250, 19, 48, 15, 4),
+    (214, 59, 80, 17, 4),
+    (24, 78, 130, 55, 2),
+    (169, 94, 125, 18, 1),
+    (169, 115, 125, 16, 4),
+    (16, 159, 139, 17, 4),
+    (16, 178, 139, 27, 3),
+    (16, 207, 139, 16, 4),
+    (171, 159, 133, 17, 4),
+    (171, 178, 133, 27, 3),
+    (171, 207, 133, 16, 4),
+    (16, 232, 140, 18, 1),
+    (175, 229, 129, 22, 0),
+    (28, 256, 276, 16, 4),
+];
 const NIN_KEYSELECT: u32 = 0x401;
 const TRAY: u32 = WM_APP + 1;
 const RESULT: u32 = WM_APP + 2;
@@ -316,47 +339,19 @@ impl App {
     }
     unsafe fn create_controls(&mut self) {
         unsafe {
-            let specs = [
-                (68, 21, 224, 25, 0),
-                (68, 47, 214, 18, 1),
-                (330, 32, 60, 18, 4),
-                (42, 104, 336, 19, 4),
-                (38, 128, 196, 88, 2),
-                (244, 175, 130, 22, 1),
-                (42, 246, 336, 18, 4),
-                (64, 310, 126, 18, 4),
-                (42, 338, 145, 34, 3),
-                (42, 376, 146, 17, 4),
-                (256, 310, 128, 18, 4),
-                (234, 338, 140, 34, 3),
-                (234, 376, 145, 17, 4),
-                (24, 427, 180, 18, 1),
-                (214, 422, 182, 26, 0),
-                (42, 482, 354, 28, 4),
-            ];
-            self.fonts = vec![
-                self.font(18, 600),
-                self.font(12, 400),
-                self.font(64, 600),
-                self.font(24, 600),
-                self.font(11, 500),
-            ];
+            self.fonts = FONT_SPECS
+                .iter()
+                .map(|(size, weight)| self.font(*size, *weight))
+                .collect();
             if let Some(host) =
                 (GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const Host).as_ref()
             {
                 host.theme.set(PaintTheme::from_app(self));
             }
-            for (i, (x, y, width, height, font)) in specs.iter().enumerate() {
-                let alignment = if i == 2 {
-                    SS_CENTER
-                } else if i == 14 {
-                    SS_RIGHT
-                } else {
-                    SS_LEFT
-                };
+            for (i, (x, y, width, height, font)) in LABEL_SPECS.iter().enumerate() {
                 let style = WS_CHILD
                     | WS_VISIBLE
-                    | WINDOW_STYLE(alignment.0 | SS_ENDELLIPSIS.0 | SS_NOPREFIX.0);
+                    | WINDOW_STYLE(SS_OWNERDRAW.0 | SS_ENDELLIPSIS.0 | SS_NOPREFIX.0);
                 let child = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("STATIC"),
@@ -381,7 +376,7 @@ impl App {
                 self.labels.push(child);
                 self.label_texts.borrow_mut().push(String::new());
             }
-            for (id, name, x) in [(REFRESH, "Refresh usage", 24), (SETTINGS, "Settings", 216)] {
+            for (id, name, x) in [(REFRESH, "Refresh usage", 16), (SETTINGS, "Settings", 164)] {
                 let text = wide(name);
                 let child = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -389,9 +384,9 @@ impl App {
                     PCWSTR(text.as_ptr()),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
                     self.px(x),
-                    self.px(514),
-                    self.px(180),
-                    self.px(32),
+                    self.px(278),
+                    self.px(140),
+                    self.px(28),
                     Some(self.hwnd),
                     Some(HMENU(id as usize as *mut _)),
                     None,
@@ -446,7 +441,6 @@ impl App {
             let now = model::unix_now();
             self.last_render_second = now;
             self.set_label(0, "TokWatch");
-            self.set_label(1, "Your Codex allowance");
             self.set_label(
                 2,
                 &self
@@ -458,10 +452,16 @@ impl App {
             );
             let selected = self.selected();
             self.set_label(
+                1,
+                selected
+                    .map(|(pool, _)| pool.name.as_str())
+                    .unwrap_or("Codex"),
+            );
+            self.set_label(
                 3,
                 &selected
-                    .map(|(p, w)| format!("{}  /  {}", p.name, w.duration_label()))
-                    .unwrap_or_else(|| "CODEX USAGE".into()),
+                    .map(|(_, w)| w.duration_label())
+                    .unwrap_or_else(|| "Usage".into()),
             );
             self.set_label(
                 4,
@@ -479,11 +479,11 @@ impl App {
                 },
             );
             let hero_note = if self.stale() && self.snapshot.is_some() {
-                "Showing your last successful reading".into()
+                "Cached reading".into()
             } else if self.snapshot.is_some() {
-                format!("Refreshes every {} min", self.settings.poll_seconds() / 60)
+                format!("Every {} min", self.settings.poll_seconds() / 60)
             } else {
-                "Connect Codex to see your usage".into()
+                "Usage unavailable".into()
             };
             self.set_label(6, &hero_note);
             self.set_label(7, "Next reset");
@@ -520,7 +520,7 @@ impl App {
                         if t <= now {
                             "Expiry due".into()
                         } else {
-                            format!("Next expiry in {}", model::countdown(Some(t), now))
+                            format!("Expires in {}", model::countdown(Some(t), now))
                         }
                     })
                     .unwrap_or_else(|| {
@@ -615,7 +615,9 @@ impl App {
             let text = if unknown {
                 "?".into()
             } else {
-                amount.map(|n| n.to_string()).unwrap_or_else(|| "?".into())
+                amount
+                    .map(|n| format!("{n}%"))
+                    .unwrap_or_else(|| "?".into())
             };
             let key = format!("{text}-{}-{}", self.dark, self.dpi);
             if self.icon_key == key {
@@ -624,7 +626,7 @@ impl App {
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
             }
-            self.icon = make_icon(&text, self.dark, self.dpi);
+            self.icon = ui_tray::make_icon(&text, self.dark, self.dpi);
             self.icon_key = key;
             let mut nid = self.nid();
             nid.uFlags = NIF_TIP | NIF_ICON;
@@ -644,7 +646,7 @@ impl App {
     unsafe fn add_tray(&mut self) {
         unsafe {
             if self.icon.is_invalid() {
-                self.icon = make_icon("?", self.dark, self.dpi);
+                self.icon = ui_tray::make_icon("?", self.dark, self.dpi);
             }
             let mut nid = self.nid();
             nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
@@ -715,6 +717,7 @@ impl App {
             self.visible = false;
             let _ = ShowWindow(self.hwnd, SW_HIDE);
             let _ = KillTimer(Some(self.hwnd), HOVER);
+            ui_render::release();
         }
     }
     unsafe fn menu(&mut self) {
@@ -1297,9 +1300,19 @@ unsafe extern "system" fn window_proc(
         if message == WM_DRAWITEM && lparam.0 != 0 {
             let item = &*(lparam.0 as *const DRAWITEMSTRUCT);
             let theme = host.theme.get();
-            let mut text = [0u16; 128];
+            let mut text = [0u16; 2048];
             let length = GetWindowTextW(item.hwndItem, &mut text);
             let text = String::from_utf16_lossy(&text[..length as usize]);
+            if (300..316).contains(&item.CtlID) {
+                ui_style::paint_label(
+                    theme.dpi,
+                    theme.dark,
+                    item,
+                    (item.CtlID - 300) as usize,
+                    &text,
+                );
+                return LRESULT(1);
+            }
             let mut point = POINT::default();
             let _ = GetCursorPos(&mut point);
             let mut rect = RECT::default();
@@ -1324,7 +1337,7 @@ unsafe extern "system" fn window_proc(
             let theme = host.theme.get();
             let dc = HDC(wparam.0 as *mut _);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut _)) - 300;
-            let card = (2..=12).contains(&id);
+            let card = (1..=6).contains(&id);
             let _ = SetBkColor(
                 dc,
                 if card {
@@ -1572,96 +1585,6 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
             }
             _ => LRESULT(0),
         }
-    }
-}
-unsafe fn make_icon(value: &str, dark: bool, dpi: u32) -> HICON {
-    unsafe {
-        let size = (16 * dpi / 96).max(16) as i32;
-        let dc = CreateCompatibleDC(None);
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: size,
-                biHeight: -size,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut bits = std::ptr::null_mut();
-        let Ok(bitmap) = CreateDIBSection(Some(dc), &bmi, DIB_RGB_COLORS, &mut bits, None, 0)
-        else {
-            let _ = DeleteDC(dc);
-            return HICON::default();
-        };
-        let old = SelectObject(dc, bitmap.into());
-        // Do not retain a Rust slice while native GDI writes through its bitmap.
-        std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize).fill(0);
-        let font = CreateFontW(
-            -(if value.len() > 2 {
-                size * 7 / 10
-            } else {
-                size * 9 / 10
-            }),
-            0,
-            0,
-            0,
-            700,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET,
-            OUT_DEFAULT_PRECIS,
-            CLIP_DEFAULT_PRECIS,
-            ANTIALIASED_QUALITY,
-            DEFAULT_PITCH.0 as u32,
-            w!("Segoe UI"),
-        );
-        let old_font = SelectObject(dc, font.into());
-        let _ = SetBkMode(dc, TRANSPARENT);
-        let _ = SetTextColor(dc, color(255, 255, 255));
-        let mut rect = RECT {
-            left: 0,
-            top: 0,
-            right: size,
-            bottom: size,
-        };
-        let mut text = wide(value);
-        DrawTextW(
-            dc,
-            &mut text[..value.encode_utf16().count()],
-            &mut rect,
-            DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-        );
-        let _ = GdiFlush();
-        let bytes = std::slice::from_raw_parts_mut(bits as *mut u8, (size * size * 4) as usize);
-        for pixel in bytes.chunks_exact_mut(4) {
-            let alpha = pixel[0].max(pixel[1]).max(pixel[2]);
-            pixel[3] = alpha;
-            let tone = if dark { 245u16 } else { 30u16 };
-            let level = (alpha as u16 * tone / 255) as u8;
-            pixel[0] = level;
-            pixel[1] = level;
-            pixel[2] = level;
-        }
-        let mask_bytes = vec![0u8; (((size + 15) / 16) * 2 * size) as usize];
-        let mask = CreateBitmap(size, size, 1, 1, Some(mask_bytes.as_ptr() as *const _));
-        let info = ICONINFO {
-            fIcon: BOOL(1),
-            hbmMask: mask,
-            hbmColor: bitmap,
-            ..Default::default()
-        };
-        let icon = CreateIconIndirect(&info).unwrap_or_default();
-        SelectObject(dc, old_font);
-        SelectObject(dc, old);
-        let _ = DeleteObject(font.into());
-        let _ = DeleteObject(bitmap.into());
-        let _ = DeleteObject(mask.into());
-        let _ = DeleteDC(dc);
-        icon
     }
 }
 unsafe fn tray_rect(hwnd: HWND) -> Option<RECT> {
