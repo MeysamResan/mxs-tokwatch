@@ -9,7 +9,11 @@ use std::env;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+    mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TryRecvError},
+};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -26,6 +30,7 @@ use windows::Win32::{
 };
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const REPLY_QUEUE_CAPACITY: usize = 8;
 
@@ -117,6 +122,55 @@ fn find_npm_binary(prefix: &Path) -> Option<PathBuf> {
     None
 }
 
+/// Keep one account helper between refreshes instead of repeatedly interrupting
+/// its startup and Windows authentication/IPC cleanup.
+#[derive(Default)]
+pub struct Session {
+    active: Option<(PathBuf, Client)>,
+    stopping: Arc<AtomicBool>,
+}
+
+impl Session {
+    pub fn new(stopping: Arc<AtomicBool>) -> Self {
+        Self {
+            active: None,
+            stopping,
+        }
+    }
+
+    pub fn connect(&mut self, path: Option<PathBuf>) -> Result<&mut Client, String> {
+        let path = match path {
+            Some(path) => path,
+            None => discover_codex()?,
+        };
+        let stopping = Arc::clone(&self.stopping);
+        self.get_or_spawn(&path, |path| Client::spawn(path, stopping))
+    }
+
+    fn get_or_spawn(
+        &mut self,
+        path: &Path,
+        spawn: impl FnOnce(&Path) -> Result<Client, String>,
+    ) -> Result<&mut Client, String> {
+        let reusable = self.active.as_mut().is_some_and(|(active_path, client)| {
+            active_path == path && !client.stopped && matches!(client.child.try_wait(), Ok(None))
+        });
+        if !reusable {
+            self.clear();
+            self.active = Some((path.to_owned(), spawn(path)?));
+        }
+        Ok(&mut self.active.as_mut().expect("connected helper").1)
+    }
+
+    pub fn client(&mut self) -> Option<&mut Client> {
+        self.active.as_mut().map(|(_, client)| client)
+    }
+
+    pub fn clear(&mut self) {
+        self.active = None;
+    }
+}
+
 pub struct Client {
     child: Child,
     input: Option<ChildStdin>,
@@ -124,6 +178,7 @@ pub struct Client {
     reader: Option<JoinHandle<()>>,
     next_id: u64,
     stopped: bool,
+    stopping: Arc<AtomicBool>,
     login_id: Option<String>,
     login_completion: Option<(String, bool)>,
     #[cfg(windows)]
@@ -131,7 +186,7 @@ pub struct Client {
 }
 
 impl Client {
-    pub fn spawn(path: &Path) -> Result<Self, String> {
+    pub fn spawn(path: &Path, stopping: Arc<AtomicBool>) -> Result<Self, String> {
         if !path.is_absolute() || !path.is_file() {
             return Err("Select an existing, absolute path to the native Codex executable.".into());
         }
@@ -144,15 +199,7 @@ impl Client {
         }
 
         let mut command = Command::new(path);
-        command
-            .args(["app-server", "--listen", "stdio://"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            // App-server diagnostics may contain account or authentication data.
-            // Discard them and report only locally generated errors below.
-            .stderr(Stdio::null());
-        #[cfg(windows)]
-        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+        command.args(["app-server", "--listen", "stdio://"]);
 
         // Avoid picking up arbitrary project configuration from the app's launch
         // directory. Authentication still uses Codex's own configured home.
@@ -162,6 +209,22 @@ impl Client {
         {
             command.current_dir(home);
         }
+
+        Self::spawn_command(command, stopping)
+    }
+
+    fn spawn_command(mut command: Command, stopping: Arc<AtomicBool>) -> Result<Self, String> {
+        if stopping.load(Ordering::Acquire) {
+            return Err("The Codex connection is closing.".into());
+        }
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // App-server diagnostics may contain account or authentication data.
+            // Discard them and report only locally generated errors below.
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
 
         let mut child = command.spawn().map_err(|error| {
             format!(
@@ -209,6 +272,7 @@ impl Client {
             reader: Some(reader),
             next_id: 1,
             stopped: false,
+            stopping,
             login_id: None,
             login_completion: None,
             #[cfg(windows)]
@@ -327,6 +391,10 @@ impl Client {
     }
 
     fn request(&mut self, method: &str, params: Option<Value>) -> Result<Value, String> {
+        if self.stopping.load(Ordering::Acquire) {
+            self.stop();
+            return Err("The Codex connection is closing.".into());
+        }
         if self.stopped {
             return Err("The Codex connection closed. Refresh to reconnect.".into());
         }
@@ -339,13 +407,21 @@ impl Client {
         self.send(&message)?;
         let deadline = Instant::now() + REQUEST_TIMEOUT;
         loop {
+            if self.stopping.load(Ordering::Acquire) {
+                self.stop();
+                return Err("The Codex connection is closing.".into());
+            }
             let remaining = deadline.saturating_duration_since(Instant::now());
-            let reply = match self.replies.recv_timeout(remaining) {
+            let reply = match self
+                .replies
+                .recv_timeout(remaining.min(Duration::from_millis(100)))
+            {
                 Ok(Ok(reply)) => reply,
                 Ok(Err(error)) => {
                     self.stop();
                     return Err(error);
                 }
+                Err(RecvTimeoutError::Timeout) if Instant::now() < deadline => continue,
                 Err(RecvTimeoutError::Timeout) => {
                     self.stop();
                     return Err("Codex did not respond within 30 seconds. Check your connection and refresh.".into());
@@ -389,12 +465,26 @@ impl Client {
             return;
         }
         self.stopped = true;
+        // EOF lets a cooperative stdio helper finish its own cleanup. Keep the
+        // job alive during this grace period; closing it first kills the helper.
         self.input.take();
-        // Closing the Windows job also closes stdout inherited by descendants,
-        // so joining the reader cannot leave an orphaned helper or thread.
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let exited = loop {
+            match self.child.try_wait() {
+                Ok(Some(_)) => break true,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(20));
+                }
+                _ => break false,
+            }
+        };
+        // Only an unresponsive helper needs forced termination. The job also
+        // closes stdout inherited by descendants before the reader is joined.
         #[cfg(windows)]
         self.job.take();
-        let _ = self.child.kill();
+        if !exited {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
         if let Some(reader) = self.reader.take() {
             let _ = reader.join();
@@ -705,7 +795,7 @@ mod tests {
     #[ignore = "requires an installed Codex executable and existing ChatGPT sign-in"]
     fn live_read() {
         let path = discover_codex().expect("native Codex installation");
-        let mut client = Client::spawn(&path).expect("Codex app-server handshake");
+        let mut client = Client::spawn(&path, Arc::default()).expect("Codex app-server handshake");
         assert!(matches!(
             client.read_account().expect("account read"),
             AccountStatus::SignedIn { .. }
@@ -725,3 +815,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+#[path = "codex_lifecycle_tests.rs"]
+mod lifecycle_tests;

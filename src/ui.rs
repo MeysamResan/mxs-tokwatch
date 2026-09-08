@@ -1,6 +1,6 @@
 use crate::{
     claude,
-    codex::{self, AccountStatus, Client},
+    codex::{AccountStatus, Session},
     model::{self, UsageSnapshot},
     settings::{self, Provider, Settings},
     updater,
@@ -8,7 +8,11 @@ use crate::{
 use std::{
     cell::{Cell, RefCell},
     path::PathBuf,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -40,25 +44,23 @@ mod ui_style;
 #[path = "ui_tray.rs"]
 mod ui_tray;
 const PANEL_WIDTH: i32 = 320;
-const PANEL_HEIGHT: i32 = 320;
-const FONT_SPECS: [(i32, i32); 5] = [(16, 600), (12, 400), (40, 600), (20, 600), (11, 500)];
-const LABEL_SPECS: [(i32, i32, i32, i32, usize); 16] = [
-    (46, 14, 180, 22, 0),
-    (24, 59, 181, 17, 1),
-    (250, 19, 48, 15, 4),
-    (214, 59, 80, 17, 4),
-    (24, 78, 130, 55, 2),
-    (169, 94, 125, 18, 1),
-    (169, 115, 125, 16, 4),
-    (16, 159, 139, 17, 4),
-    (16, 178, 139, 27, 3),
-    (16, 207, 139, 16, 4),
-    (171, 159, 133, 17, 4),
-    (171, 178, 133, 27, 3),
-    (171, 207, 133, 16, 4),
-    (16, 232, 140, 18, 1),
-    (175, 229, 129, 22, 0),
-    (28, 256, 276, 16, 4),
+const PANEL_HEIGHT: i32 = 292;
+const FONT_SPECS: [(i32, i32); 5] = [(12, 600), (12, 400), (28, 600), (18, 600), (11, 400)];
+const LABEL_SPECS: [(i32, i32, i32, i32, usize); 14] = [
+    (24, 16, 190, 18, 0),
+    (222, 16, 74, 18, 4),
+    (24, 36, 80, 38, 2),
+    (112, 46, 184, 18, 1),
+    (24, 87, 272, 16, 4),
+    (24, 124, 118, 16, 4),
+    (24, 141, 118, 24, 3),
+    (24, 169, 118, 16, 4),
+    (178, 124, 118, 16, 4),
+    (178, 141, 118, 24, 3),
+    (178, 169, 118, 16, 4),
+    (16, 196, 136, 20, 1),
+    (164, 196, 140, 20, 0),
+    (28, 227, 276, 16, 4),
 ];
 const NIN_KEYSELECT: u32 = 0x401;
 const TRAY: u32 = WM_APP + 1;
@@ -66,6 +68,13 @@ const RESULT: u32 = WM_APP + 2;
 const SHOW_PANEL: u32 = WM_APP + 4;
 const TICK: usize = 1;
 const PANEL_TICK: usize = 2;
+const MOTION_TICK: usize = 3;
+const APPEARANCE_CHANGED: u32 = WM_APP + 5;
+const CONTROL_CHANGED: u32 = WM_APP + 6;
+#[path = "ui_motion.rs"]
+mod ui_motion;
+#[path = "ui_theme.rs"]
+mod ui_theme;
 const PROVIDER_CODEX: u16 = 110;
 const PROVIDER_CLAUDE: u16 = 111;
 const CHECK_UPDATES: u16 = 112;
@@ -191,33 +200,47 @@ enum Update {
 struct Worker {
     tx: Sender<Command>,
     rx: Receiver<Update>,
+    thread: Option<thread::JoinHandle<()>>,
+    stopping: Arc<AtomicBool>,
+}
+impl Worker {
+    fn stop(&mut self) {
+        self.stopping.store(true, Ordering::Release);
+        let _ = self.tx.send(Command::Stop);
+        if let Some(thread) = self.thread.take() {
+            // Let the worker close its helper before process exit closes every
+            // handle, including the helper's kill-on-close job.
+            let _ = thread.join();
+        }
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 fn worker(hwnd: HWND) -> Worker {
     let (tx, commands) = mpsc::channel();
     let (results, rx) = mpsc::channel();
     let handle = hwnd.0 as isize;
-    thread::spawn(move || {
-        let mut login: Option<Client> = None;
+    let stopping = Arc::new(AtomicBool::new(false));
+    let worker_stopping = Arc::clone(&stopping);
+    let thread = thread::spawn(move || {
+        let mut session = Session::new(Arc::clone(&worker_stopping));
         let mut login_started: Option<Instant> = None;
-        let connect = |path: Option<PathBuf>| -> Result<Client, String> {
-            Client::spawn(&match path {
-                Some(p) => p,
-                None => codex::discover_codex()?,
-            })
-        };
         while let Ok(command) = commands.recv() {
-            if matches!(command, Command::Stop) {
+            if matches!(command, Command::Stop) || worker_stopping.load(Ordering::Acquire) {
                 break;
             }
             let result: Result<Update, String> = (|| match command {
                 Command::Stop => Ok(Update::Pending),
                 Command::Refresh(provider, path) => {
-                    login = None;
                     login_started = None;
                     if provider == Provider::Claude {
+                        session.clear();
                         return claude::read_limits().map(Update::Snapshot);
                     }
-                    let mut client = connect(path)?;
+                    let client = session.connect(path)?;
                     match client.read_account()? {
                         AccountStatus::SignedIn { .. } => {
                             Ok(Update::Snapshot(client.read_limits()?))
@@ -227,28 +250,31 @@ fn worker(hwnd: HWND) -> Worker {
                     }
                 }
                 Command::Connect(provider, path) => {
+                    session.clear();
+                    login_started = None;
                     if provider == Provider::Claude {
                         claude::connect()?;
                         return Ok(Update::ClaudeConnected);
                     }
-                    let mut client = connect(path)?;
+                    let client = session.connect(path)?;
                     let url = client.start_login()?;
-                    login = Some(client);
                     login_started = Some(Instant::now());
                     Ok(Update::OpenLogin(url))
                 }
                 Command::CheckLogin => {
                     if login_started.is_some_and(|t| t.elapsed() > Duration::from_secs(300)) {
-                        login = None;
+                        session.clear();
                         login_started = None;
                         return Err("Sign-in timed out. Choose Connect to try again.".into());
                     }
-                    let Some(client) = login.as_mut() else {
+                    if login_started.is_none() {
+                        return Ok(Update::Pending);
+                    }
+                    let Some(client) = session.client() else {
                         return Ok(Update::Pending);
                     };
                     if client.poll_login()? {
                         let snapshot = client.read_limits()?;
-                        login = None;
                         login_started = None;
                         Ok(Update::Snapshot(snapshot))
                     } else {
@@ -257,11 +283,11 @@ fn worker(hwnd: HWND) -> Worker {
                 }
             })();
             let update = result.unwrap_or_else(|e| {
-                login = None;
+                session.clear();
                 login_started = None;
                 Update::Error(e)
             });
-            if results.send(update).is_err() {
+            if worker_stopping.load(Ordering::Acquire) || results.send(update).is_err() {
                 break;
             }
             unsafe {
@@ -269,7 +295,12 @@ fn worker(hwnd: HWND) -> Worker {
             }
         }
     });
-    Worker { tx, rx }
+    Worker {
+        tx,
+        rx,
+        thread: Some(thread),
+        stopping,
+    }
 }
 struct App {
     hwnd: HWND,
@@ -287,6 +318,16 @@ struct App {
     visible: bool,
     demo: bool,
     dark: bool,
+    appearance: ui_theme::Appearance,
+    glass: bool,
+    panel_bounds: RECT,
+    panel_offset: i32,
+    panel_value: f32,
+    panel_motion: Option<ui_motion::Tween>,
+    meter_value: f32,
+    meter_motion: Option<ui_motion::Tween>,
+    hover: [f32; 2],
+    hover_motion: [Option<ui_motion::Tween>; 2],
     dpi: u32,
     panel_dpi: u32,
     brush: HBRUSH,
@@ -314,7 +355,11 @@ impl App {
         n * self.panel_dpi as i32 / 96
     }
     fn palette(&self) -> ui_style::Palette {
-        ui_style::palette(self.dark)
+        ui_style::palette_for(
+            self.dark,
+            self.appearance.accent,
+            self.appearance.high_contrast,
+        )
     }
     fn bg(&self) -> COLORREF {
         self.palette().bg
@@ -466,7 +511,7 @@ impl App {
                 self.labels.push(child);
                 self.label_texts.borrow_mut().push(String::new());
             }
-            for (id, name, x) in [(REFRESH, "Refresh usage", 16), (SETTINGS, "Settings", 164)] {
+            for (id, name, x) in [(REFRESH, "Refresh usage", 12), (SETTINGS, "Settings", 166)] {
                 let text = wide(name);
                 let child = CreateWindowExW(
                     WINDOW_EX_STYLE(0),
@@ -474,9 +519,9 @@ impl App {
                     PCWSTR(text.as_ptr()),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | WINDOW_STYLE(BS_OWNERDRAW as u32),
                     self.px(x),
-                    self.px(278),
-                    self.px(140),
-                    self.px(28),
+                    self.px(250),
+                    self.px(142),
+                    self.px(30),
                     Some(self.hwnd),
                     Some(HMENU(id as usize as *mut _)),
                     None,
@@ -530,38 +575,35 @@ impl App {
         unsafe {
             let now = model::unix_now();
             self.last_render_second = now;
-            self.set_label(0, "TokWatch");
-            self.set_label(
-                2,
-                &self
-                    .snapshot
-                    .as_ref()
-                    .and_then(|s| s.plan())
-                    .map(title_case)
-                    .unwrap_or_else(|| self.settings.provider.name().into()),
-            );
             let selected = self.selected();
+            let pool_name = selected
+                .map(|(pool, _)| pool.name.as_str())
+                .unwrap_or(self.settings.provider.name());
+            let heading = self
+                .snapshot
+                .as_ref()
+                .and_then(|s| s.plan())
+                .filter(|plan| !plan.trim().is_empty())
+                .map_or_else(
+                    || pool_name.to_owned(),
+                    |plan| format!("{pool_name} · {}", title_case(plan)),
+                );
+            self.set_label(0, &heading);
             self.set_label(
                 1,
-                selected
-                    .map(|(pool, _)| pool.name.as_str())
-                    .unwrap_or(self.settings.provider.name()),
-            );
-            self.set_label(
-                3,
                 &selected
                     .map(|(_, w)| w.duration_label())
                     .unwrap_or_else(|| "Usage".into()),
             );
             self.set_label(
-                4,
+                2,
                 &selected
                     .and_then(|(_, w)| w.remaining_percent())
                     .map(|n| format!("{n}%"))
-                    .unwrap_or_else(|| "—".into()),
+                    .unwrap_or_else(|| "Usage unavailable".into()),
             );
             self.set_label(
-                5,
+                3,
                 if self.stale() && self.snapshot.is_some() {
                     "last known"
                 } else {
@@ -577,16 +619,16 @@ impl App {
             } else {
                 "Usage unavailable".into()
             };
-            self.set_label(6, &hero_note);
-            self.set_label(7, "Next reset");
+            self.set_label(4, &hero_note);
+            self.set_label(5, "Next reset");
             self.set_label(
-                8,
+                6,
                 &selected
                     .and_then(|(_, w)| w.resets_at.map(|_| w.reset_countdown(now)))
                     .unwrap_or_else(|| "—".into()),
             );
             self.set_label(
-                9,
+                7,
                 &selected
                     .and_then(|(_, w)| w.resets_at)
                     .map(short_local_date)
@@ -596,16 +638,16 @@ impl App {
                 .snapshot
                 .as_ref()
                 .and_then(|s| s.reset_credits.as_ref());
-            self.set_label(10, "Full resets");
+            self.set_label(8, "Full resets");
             self.set_label(
-                11,
+                9,
                 &credits
                     .and_then(|c| c.available_count)
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "—".into()),
             );
             self.set_label(
-                12,
+                10,
                 &credits
                     .and_then(|c| c.next_expiry())
                     .map(|t| {
@@ -634,20 +676,20 @@ impl App {
                         })
                     });
                 self.set_label(
-                    10,
+                    8,
                     &other
                         .map(|w| w.duration_label())
                         .unwrap_or_else(|| "Other window".into()),
                 );
                 self.set_label(
-                    11,
+                    9,
                     &other
                         .and_then(|w| w.remaining_percent())
                         .map(|n| format!("{n}%"))
                         .unwrap_or_else(|| "—".into()),
                 );
                 self.set_label(
-                    12,
+                    10,
                     &other
                         .filter(|w| w.resets_at.is_some())
                         .map(|w| format!("Resets in {}", w.reset_countdown(now)))
@@ -655,7 +697,7 @@ impl App {
                 );
             }
             self.set_label(
-                13,
+                11,
                 if self.settings.provider == Provider::Claude {
                     "Source"
                 } else {
@@ -678,7 +720,7 @@ impl App {
                 })
                 .unwrap_or_else(|| "—".into());
             self.set_label(
-                14,
+                12,
                 if self.settings.provider == Provider::Claude {
                     "Claude Code"
                 } else {
@@ -727,7 +769,7 @@ impl App {
             } else {
                 self.status.clone()
             };
-            self.set_label(15, &status);
+            self.set_label(13, &status);
             let button = if self.login_pending {
                 "Signing in…"
             } else if self.primary_connect() {
@@ -744,6 +786,8 @@ impl App {
                 self.buttons[0],
                 !self.busy && !self.login_pending && (!self.demo || self.snapshot.is_some()),
             );
+            self.retarget_meter();
+            self.repaint_motion();
             self.update_tray();
             let _ = InvalidateRect(Some(self.hwnd), None, false);
             for button in &self.buttons {
@@ -770,11 +814,14 @@ impl App {
                     .map(|n| format!("{n}%"))
                     .unwrap_or_else(|| "?".into())
             };
+            let icon_dpi = tray_icon_dpi(self.hwnd, self.dpi);
             let key = format!(
-                "{text}-{}-{}-{}",
+                "{text}-{}-{}-{}-{}-{}",
                 self.dark,
-                self.dpi,
-                self.settings.provider.name()
+                icon_dpi,
+                self.settings.provider.name(),
+                self.palette().accent.0,
+                self.appearance.high_contrast
             );
             if self.icon_key == key && self.tray_added {
                 return;
@@ -782,7 +829,13 @@ impl App {
             if !self.icon.is_invalid() {
                 let _ = DestroyIcon(self.icon);
             }
-            self.icon = ui_tray::make_icon(&text, self.dark, self.dpi);
+            self.icon = ui_tray::make_icon(
+                &text,
+                self.dark,
+                icon_dpi,
+                self.appearance.accent,
+                self.appearance.high_contrast,
+            );
             self.icon_key = key;
             let mut nid = self.nid();
             nid.uFlags = NIF_MESSAGE | NIF_TIP | NIF_ICON | NIF_SHOWTIP;
@@ -804,6 +857,10 @@ impl App {
                 self.tray_added = true;
                 nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
                 let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+                // The icon rectangle becomes available only after registration.
+                if tray_icon_dpi(self.hwnd, self.dpi) != icon_dpi {
+                    self.update_tray();
+                }
             }
         }
     }
@@ -830,8 +887,164 @@ impl App {
             self.create_controls();
         }
     }
+    fn motion_enabled(&self) -> bool {
+        self.appearance.animations
+    }
+    unsafe fn repaint_motion(&self) {
+        unsafe {
+            if let Some(host) =
+                (GetWindowLongPtrW(self.hwnd, GWLP_USERDATA) as *const Host).as_ref()
+            {
+                host.theme.set(PaintTheme::from_app(self));
+            }
+            let _ = InvalidateRect(Some(self.hwnd), None, false);
+            for button in &self.buttons {
+                let _ = InvalidateRect(Some(*button), None, false);
+            }
+        }
+    }
+    unsafe fn retarget_meter(&mut self) {
+        let target = self
+            .selected()
+            .and_then(|(_, w)| w.remaining_percent())
+            .unwrap_or(0) as f32;
+        if self.meter_motion.is_some_and(|t| t.target() == target) {
+            return;
+        }
+        if (target - self.meter_value).abs() < 0.01 {
+            self.meter_motion = None;
+            return;
+        }
+        if self.visible && self.motion_enabled() {
+            self.meter_motion = Some(ui_motion::Tween::new(
+                self.meter_value,
+                target,
+                Instant::now(),
+                240,
+            ));
+            unsafe {
+                SetTimer(Some(self.hwnd), MOTION_TICK, 16, None);
+            }
+        } else {
+            self.meter_value = target;
+            self.meter_motion = None;
+        }
+    }
+    unsafe fn hover_changed(&mut self) {
+        unsafe {
+            let mut point = POINT::default();
+            let _ = GetCursorPos(&mut point);
+            for (index, button) in self.buttons.iter().enumerate() {
+                let mut rect = RECT::default();
+                let _ = GetWindowRect(*button, &mut rect);
+                let hovered = self.visible
+                    && point.x >= rect.left
+                    && point.x < rect.right
+                    && point.y >= rect.top
+                    && point.y < rect.bottom;
+                let target = if hovered { 1.0 } else { 0.0 };
+                if self.hover_motion[index].is_some_and(|t| t.target() == target) {
+                    continue;
+                }
+                if self.motion_enabled() && (target - self.hover[index]).abs() > 0.01 {
+                    self.hover_motion[index] = Some(ui_motion::Tween::new(
+                        self.hover[index],
+                        target,
+                        Instant::now(),
+                        100,
+                    ));
+                    SetTimer(Some(self.hwnd), MOTION_TICK, 16, None);
+                } else {
+                    self.hover[index] = target;
+                    self.hover_motion[index] = None;
+                }
+            }
+            self.repaint_motion();
+        }
+    }
+    unsafe fn finish_motion(&mut self) {
+        unsafe {
+            if self.panel_motion.is_some_and(|t| t.target() == 0.0) {
+                self.finish_hide();
+            } else {
+                self.panel_motion = None;
+                self.panel_value = if self.visible { 1.0 } else { 0.0 };
+                if self.visible {
+                    let _ = SetWindowPos(
+                        self.hwnd,
+                        None,
+                        self.panel_bounds.left,
+                        self.panel_bounds.top,
+                        0,
+                        0,
+                        SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+                    );
+                }
+            }
+            if let Some(tween) = self.meter_motion.take() {
+                self.meter_value = tween.target();
+            }
+            for index in 0..2 {
+                if let Some(tween) = self.hover_motion[index].take() {
+                    self.hover[index] = tween.target();
+                }
+            }
+            let _ = KillTimer(Some(self.hwnd), MOTION_TICK);
+            self.repaint_motion();
+        }
+    }
+    unsafe fn animate(&mut self) {
+        unsafe {
+            let now = Instant::now();
+            if let Some(tween) = self.panel_motion {
+                let (value, done) = tween.sample(now);
+                self.panel_value = value;
+                let rect = self.panel_bounds;
+                let _ = SetWindowPos(
+                    self.hwnd,
+                    None,
+                    rect.left,
+                    rect.top + ((1.0 - value) * self.panel_offset as f32).round() as i32,
+                    0,
+                    0,
+                    SWP_NOACTIVATE | SWP_NOSIZE | SWP_NOZORDER,
+                );
+                if done {
+                    self.panel_motion = None;
+                    if tween.target() == 0.0 {
+                        self.finish_hide();
+                        return;
+                    }
+                }
+            }
+            if let Some(tween) = self.meter_motion {
+                let (value, done) = tween.sample(now);
+                self.meter_value = value;
+                if done {
+                    self.meter_motion = None;
+                }
+            }
+            for index in 0..2 {
+                if let Some(tween) = self.hover_motion[index] {
+                    let (value, done) = tween.sample(now);
+                    self.hover[index] = value;
+                    if done {
+                        self.hover_motion[index] = None;
+                    }
+                }
+            }
+            self.repaint_motion();
+            if self.panel_motion.is_none()
+                && self.meter_motion.is_none()
+                && self.hover_motion.iter().all(Option::is_none)
+            {
+                let _ = KillTimer(Some(self.hwnd), MOTION_TICK);
+            }
+        }
+    }
     unsafe fn show(&mut self, pinned: bool) {
         unsafe {
+            let was_visible = self.visible;
             self.pinned |= pinned;
             self.visible = true;
             let rect = tray_rect(self.hwnd).unwrap_or_else(|| {
@@ -848,11 +1061,34 @@ impl App {
             self.dpi = dpi;
             let (panel_dpi, bounds) = panel_geometry(dpi, work, PanelAnchor::Tray(rect));
             self.resize_panel(panel_dpi);
+            self.panel_bounds = bounds;
+            self.panel_offset = if bounds.bottom <= rect.top {
+                self.px(12).min(work.bottom - bounds.bottom)
+            } else {
+                -self.px(12).min(bounds.top - work.top)
+            };
+            if self.motion_enabled() {
+                if !was_visible {
+                    self.panel_value = 0.0;
+                    self.meter_value = 0.0;
+                    self.meter_motion = None;
+                }
+                self.panel_motion = Some(ui_motion::Tween::new(
+                    self.panel_value,
+                    1.0,
+                    Instant::now(),
+                    180,
+                ));
+                SetTimer(Some(self.hwnd), MOTION_TICK, 16, None);
+            } else {
+                self.panel_value = 1.0;
+                self.panel_motion = None;
+            }
             let _ = SetWindowPos(
                 self.hwnd,
                 Some(HWND_TOPMOST),
                 bounds.left,
-                bounds.top,
+                bounds.top + ((1.0 - self.panel_value) * self.panel_offset as f32).round() as i32,
                 bounds.right - bounds.left,
                 bounds.bottom - bounds.top,
                 SWP_NOACTIVATE,
@@ -865,13 +1101,37 @@ impl App {
             self.render();
         }
     }
+    unsafe fn finish_hide(&mut self) {
+        unsafe {
+            self.visible = false;
+            self.pinned = false;
+            self.panel_value = 0.0;
+            self.panel_motion = None;
+            self.meter_motion = None;
+            self.hover_motion = [None; 2];
+            self.hover = [0.0; 2];
+            let _ = ShowWindow(self.hwnd, SW_HIDE);
+            let _ = KillTimer(Some(self.hwnd), PANEL_TICK);
+            let _ = KillTimer(Some(self.hwnd), MOTION_TICK);
+            ui_render::release();
+        }
+    }
     unsafe fn hide(&mut self) {
         unsafe {
             self.pinned = false;
-            self.visible = false;
-            let _ = ShowWindow(self.hwnd, SW_HIDE);
-            let _ = KillTimer(Some(self.hwnd), PANEL_TICK);
-            ui_render::release();
+            if self.visible && self.motion_enabled() {
+                if !self.panel_motion.is_some_and(|t| t.target() == 0.0) {
+                    self.panel_motion = Some(ui_motion::Tween::new(
+                        self.panel_value,
+                        0.0,
+                        Instant::now(),
+                        100,
+                    ));
+                    SetTimer(Some(self.hwnd), MOTION_TICK, 16, None);
+                }
+            } else {
+                self.finish_hide();
+            }
         }
     }
     unsafe fn menu(&mut self) {
@@ -1195,7 +1455,7 @@ impl App {
                     let _ = MessageBoxW(
                         Some(self.hwnd),
                         w!(
-                            "TokWatch 0.2.0\n\nNative Windows monitor for Codex and Claude allowance.\nRust + Win32. Account readings stay local.\n\nCodex uses its official helper. Claude uses its local Claude Code status line.\n\nClick for details. Escape to dismiss.\nGitHub updates are verified before installation."
+                            "TokWatch 0.3.0\n\nNative Windows monitor for Codex and Claude allowance.\nRust + Win32. Account readings stay local.\n\nCodex uses its official helper. Claude uses its local Claude Code status line.\n\nClick for details. Escape to dismiss.\nGitHub updates are verified before installation."
                         ),
                         w!("About TokWatch"),
                         MB_OK,
@@ -1359,10 +1619,11 @@ struct PaintTheme {
     brush: HBRUSH,
     surface_brush: HBRUSH,
     surface: COLORREF,
-    accent: COLORREF,
     dpi: u32,
-    dark: bool,
     button_font: HFONT,
+    colors: ui_style::Palette,
+    glass: bool,
+    hover: [f32; 2],
 }
 impl PaintTheme {
     fn from_app(app: &App) -> Self {
@@ -1373,10 +1634,11 @@ impl PaintTheme {
             brush: app.brush,
             surface_brush: app.surface_brush,
             surface: app.palette().surface,
-            accent: app.palette().accent,
             dpi: app.panel_dpi,
-            dark: app.dark,
             button_font: app.fonts.get(1).copied().unwrap_or_default(),
+            colors: app.palette(),
+            glass: app.glass,
+            hover: app.hover,
         }
     }
 }
@@ -1405,12 +1667,28 @@ impl Host {
         queue.retain(|old| {
             if event.message == WM_TIMER {
                 old.message != WM_TIMER || old.wparam.0 != event.wparam.0
-            } else if matches!(event.message, RESULT | WM_ACTIVATE | WM_DPICHANGED)
-                || event.message == self.taskbar_created
+            } else if matches!(
+                event.message,
+                RESULT | WM_ACTIVATE | WM_DPICHANGED | WM_DISPLAYCHANGE | CONTROL_CHANGED
+            ) || event.message == self.taskbar_created
             {
                 old.message != event.message
-            } else if matches!(event.message, WM_SETTINGCHANGE | WM_THEMECHANGED) {
-                !matches!(old.message, WM_SETTINGCHANGE | WM_THEMECHANGED)
+            } else if matches!(
+                event.message,
+                WM_SETTINGCHANGE
+                    | WM_THEMECHANGED
+                    | WM_DWMCOLORIZATIONCOLORCHANGED
+                    | WM_DWMCOMPOSITIONCHANGED
+                    | APPEARANCE_CHANGED
+            ) {
+                !matches!(
+                    old.message,
+                    WM_SETTINGCHANGE
+                        | WM_THEMECHANGED
+                        | WM_DWMCOLORIZATIONCOLORCHANGED
+                        | WM_DWMCOMPOSITIONCHANGED
+                        | APPEARANCE_CHANGED
+                )
             } else {
                 true
             }
@@ -1458,6 +1736,7 @@ unsafe fn new_host(
 ) -> Box<Host> {
     unsafe {
         let dark = system_dark();
+        let appearance = ui_theme::Appearance::read();
         let dpi = GetDpiForWindow(hwnd).max(96);
         let app = App {
             hwnd,
@@ -1475,6 +1754,16 @@ unsafe fn new_host(
             visible: false,
             demo,
             dark,
+            appearance,
+            glass: false,
+            panel_bounds: RECT::default(),
+            panel_offset: 0,
+            panel_value: 0.0,
+            panel_motion: None,
+            meter_value: 0.0,
+            meter_motion: None,
+            hover: [0.0; 2],
+            hover_motion: [None; 2],
             dpi,
             panel_dpi: dpi,
             brush: CreateSolidBrush(ui_style::palette(dark).bg),
@@ -1516,6 +1805,7 @@ unsafe fn new_host(
     }
 }
 pub fn run() {
+    let _runtime = ui_theme::Runtime::new();
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         let mutex =
@@ -1584,7 +1874,11 @@ pub fn run() {
             }
         };
         let host = new_host(hwnd, settings, snapshot, demo, setting_error);
-        apply_window_style(hwnd, host.app.borrow().dark);
+        let _appearance_observer = ui_theme::Observer::new(hwnd);
+        {
+            let mut app = host.app.borrow_mut();
+            app.glass = apply_window_style(hwnd, app.dark, app.appearance);
+        }
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*host as *const Host) as isize);
         {
             let mut app = host.app.borrow_mut();
@@ -1629,8 +1923,10 @@ pub fn run() {
         if IsWindow(Some(hwnd)).as_bool() {
             let _ = DestroyWindow(hwnd);
         }
-        let app = host.app.borrow_mut();
-        let _ = app.worker.tx.send(Command::Stop);
+        let mut app = host.app.borrow_mut();
+        // Finish helper cleanup before releasing the singleton mutex, which
+        // the installer uses to decide that replacement can proceed.
+        app.worker.stop();
         let _ = Shell_NotifyIconW(NIM_DELETE, &app.nid());
         if !app.icon.is_invalid() {
             let _ = DestroyIcon(app.icon);
@@ -1677,33 +1973,16 @@ unsafe extern "system" fn window_proc(
             let mut text = [0u16; 2048];
             let length = GetWindowTextW(item.hwndItem, &mut text);
             let text = String::from_utf16_lossy(&text[..length as usize]);
-            if (300..316).contains(&item.CtlID) {
-                ui_style::paint_label(
-                    theme.dpi,
-                    theme.dark,
-                    item,
-                    (item.CtlID - 300) as usize,
-                    &text,
-                );
+            if (300..300 + LABEL_SPECS.len() as u32).contains(&item.CtlID) {
+                ui_style::paint_label(theme, item, (item.CtlID - 300) as usize, &text);
                 return LRESULT(1);
             }
-            let mut point = POINT::default();
-            let _ = GetCursorPos(&mut point);
-            let mut rect = RECT::default();
-            let _ = GetWindowRect(item.hwndItem, &mut rect);
-            let hovered = IsWindowVisible(hwnd).as_bool()
-                && point.x >= rect.left
-                && point.x < rect.right
-                && point.y >= rect.top
-                && point.y < rect.bottom;
             ui_style::paint_button(
-                theme.dpi,
-                theme.dark,
-                theme.button_font,
+                theme,
                 item,
                 &text,
                 item.CtlID == REFRESH as u32,
-                hovered,
+                theme.hover[usize::from(item.CtlID == SETTINGS as u32)],
             );
             return LRESULT(1);
         }
@@ -1711,7 +1990,7 @@ unsafe extern "system" fn window_proc(
             let theme = host.theme.get();
             let dc = HDC(wparam.0 as *mut _);
             let id = GetDlgCtrlID(HWND(lparam.0 as *mut _)) - 300;
-            let card = (1..=6).contains(&id);
+            let card = (0..=10).contains(&id);
             let _ = SetBkColor(
                 dc,
                 if card {
@@ -1720,9 +1999,7 @@ unsafe extern "system" fn window_proc(
                     theme.background
                 },
             );
-            let ink = if id == 2 {
-                theme.accent
-            } else if matches!(id, 0 | 4 | 8 | 11 | 14) {
+            let ink = if matches!(id, 0 | 2 | 6 | 9 | 12) {
                 theme.foreground
             } else {
                 theme.muted
@@ -1747,7 +2024,12 @@ unsafe extern "system" fn window_proc(
                 | WM_ACTIVATE
                 | WM_SETTINGCHANGE
                 | WM_THEMECHANGED
+                | WM_DWMCOLORIZATIONCOLORCHANGED
+                | WM_DWMCOMPOSITIONCHANGED
+                | APPEARANCE_CHANGED
+                | CONTROL_CHANGED
                 | WM_DPICHANGED
+                | WM_DISPLAYCHANGE
                 | WM_POWERBROADCAST
         ) || (host.taskbar_created != 0 && message == host.taskbar_created);
         if !actionable {
@@ -1848,8 +2130,14 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
                 app.command((wparam.0 & 0xffff) as u16);
                 LRESULT(0)
             }
+            CONTROL_CHANGED => {
+                app.hover_changed();
+                LRESULT(0)
+            }
             WM_TIMER => {
-                if wparam.0 == TICK {
+                if wparam.0 == MOTION_TICK {
+                    app.animate();
+                } else if wparam.0 == TICK {
                     app.update_tray();
                     if !app.demo
                         && app.settings.automatic_updates
@@ -1891,8 +2179,14 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
                 }
                 LRESULT(0)
             }
-            WM_SETTINGCHANGE | WM_THEMECHANGED => {
+            WM_SETTINGCHANGE
+            | WM_THEMECHANGED
+            | WM_DWMCOLORIZATIONCOLORCHANGED
+            | WM_DWMCOMPOSITIONCHANGED
+            | APPEARANCE_CHANGED => {
                 app.dark = system_dark();
+                app.appearance = ui_theme::Appearance::read();
+                app.icon_key.clear();
                 let replacement = CreateSolidBrush(app.bg());
                 let surface = CreateSolidBrush(app.palette().surface);
                 if !replacement.is_invalid() && !surface.is_invalid() {
@@ -1911,8 +2205,16 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
                         let _ = DeleteObject(surface.into());
                     }
                 }
-                apply_window_style(hwnd, app.dark);
+                app.glass = apply_window_style(hwnd, app.dark, app.appearance);
+                if !app.motion_enabled() {
+                    app.finish_motion();
+                }
+                host.theme.set(PaintTheme::from_app(app));
                 app.render();
+                LRESULT(0)
+            }
+            WM_DISPLAYCHANGE => {
+                app.update_tray();
                 LRESULT(0)
             }
             WM_DPICHANGED => {
@@ -1926,6 +2228,9 @@ unsafe fn dispatch(app: &mut App, host: &Host, hwnd: HWND, event: DeferredMessag
                 let (panel_dpi, bounds) =
                     panel_geometry(app.dpi, work, PanelAnchor::Window(suggested));
                 app.resize_panel(panel_dpi);
+                app.panel_bounds = bounds;
+                app.panel_motion = None;
+                app.panel_value = 1.0;
                 app.icon_key.clear();
                 let _ = SetWindowPos(
                     hwnd,
@@ -1961,6 +2266,26 @@ unsafe fn tray_rect(hwnd: HWND) -> Option<RECT> {
         .ok()
     }
 }
+unsafe fn tray_icon_dpi(hwnd: HWND, fallback_dpi: u32) -> u32 {
+    unsafe {
+        // The flyout may be on another monitor, or have its scale constrained
+        // to fit the work area. Render for the notification area's monitor.
+        let anchor = tray_rect(hwnd).or_else(|| {
+            let taskbar = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+            let mut rect = RECT::default();
+            GetWindowRect(taskbar, &mut rect).ok()?;
+            Some(rect)
+        });
+        let Some(anchor) = anchor else {
+            return fallback_dpi.max(96);
+        };
+        let monitor = MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST);
+        let mut dpi_x = fallback_dpi;
+        let mut dpi_y = fallback_dpi;
+        let _ = GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y);
+        dpi_x.max(96)
+    }
+}
 unsafe extern "system" fn button_proc(
     hwnd: HWND,
     message: u32,
@@ -1984,32 +2309,72 @@ unsafe extern "system" fn button_proc(
         } else if message == WM_NCDESTROY {
             let _ = RemoveWindowSubclass(hwnd, Some(button_proc), 1);
         }
-        DefSubclassProc(hwnd, message, wparam, lparam)
+        let result = DefSubclassProc(hwnd, message, wparam, lparam);
+        if matches!(
+            message,
+            WM_MOUSEMOVE
+                | WM_MOUSELEAVE
+                | WM_SETFOCUS
+                | WM_KILLFOCUS
+                | WM_LBUTTONDOWN
+                | WM_LBUTTONUP
+                | BM_SETSTATE
+                | WM_ENABLE
+        ) {
+            if let Ok(parent) = GetParent(hwnd) {
+                let _ = PostMessageW(Some(parent), CONTROL_CHANGED, WPARAM(0), LPARAM(0));
+            }
+        }
+        result
     }
 }
-fn apply_window_style(hwnd: HWND, _dark: bool) {
+fn apply_window_style(hwnd: HWND, dark: bool, appearance: ui_theme::Appearance) -> bool {
     unsafe {
-        let round = DWMWCP_ROUND;
+        let round = if appearance.high_contrast {
+            DWMWCP_DONOTROUND
+        } else {
+            DWMWCP_ROUND
+        };
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE,
-            &round as *const _ as *const _,
+            (&round as *const DWM_WINDOW_CORNER_PREFERENCE).cast(),
             std::mem::size_of_val(&round) as u32,
         );
-        let mode = BOOL::from(true);
+        let mode = BOOL::from(dark);
         let _ = DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
-            &mode as *const _ as *const _,
+            (&mode as *const BOOL).cast(),
             std::mem::size_of_val(&mode) as u32,
         );
-        let border = ui_style::palette(true).border;
-        let _ = DwmSetWindowAttribute(
+        let border = 0xffffffffu32; // Let Windows draw the current system border.
+        let _ = DwmSetWindowAttribute(hwnd, DWMWA_BORDER_COLOR, (&border as *const u32).cast(), 4);
+        let material = if appearance.transparency {
+            DWMSBT_TRANSIENTWINDOW
+        } else {
+            DWMSBT_NONE
+        };
+        let applied = DwmSetWindowAttribute(
             hwnd,
-            DWMWA_BORDER_COLOR,
-            &border as *const _ as *const _,
-            std::mem::size_of_val(&border) as u32,
-        );
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&material as *const DWM_SYSTEMBACKDROP_TYPE).cast(),
+            std::mem::size_of_val(&material) as u32,
+        )
+        .is_ok();
+        let glass = appearance.transparency && applied;
+        let margins = if glass {
+            windows::Win32::UI::Controls::MARGINS {
+                cxLeftWidth: -1,
+                cxRightWidth: -1,
+                cyTopHeight: -1,
+                cyBottomHeight: -1,
+            }
+        } else {
+            Default::default()
+        };
+        let extended = DwmExtendFrameIntoClientArea(hwnd, &margins).is_ok();
+        glass && extended
     }
 }
 fn title_case(value: &str) -> String {

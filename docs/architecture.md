@@ -2,7 +2,7 @@
 
 TokWatch is a Windows notification-area application with a native Win32 panel. Rust owns state and worker coordination; Microsoft Windows bindings provide controls, drawing, registry, and process APIs. `serde` and `serde_json` handle data conversion. There is no webview, managed UI runtime, embedded browser, or database.
 
-This document describes TokWatch v0.2.0. Release history is summarized in the changelog.
+This document describes the current local TokWatch source. Release history is summarized in the changelog.
 
 ## Modules
 
@@ -10,11 +10,14 @@ This document describes TokWatch v0.2.0. Release history is summarized in the ch
 | --- | --- |
 | `src/main.rs` | Entry point, helper modes, and Windows UI dispatch |
 | `src/ui.rs` | Tray activation, native panel, provider menu, timers, worker coordination, and startup option |
-| `src/ui_style.rs` | Fixed black/charcoal/deep-red panel palette and owner-drawn controls |
+| `src/ui_style.rs` | Windows light/dark and contrast palettes, exact system accent, and owner-drawn controls |
+| `src/ui_theme.rs` | Public Windows appearance APIs and event subscriptions |
+| `src/ui_motion.rs` | Bounded, reversible easing for brief panel and control transitions |
 | `src/ui_render.rs` | Cached Direct2D/DirectWrite drawing, text layout, and test measurements |
-| `src/ui_tray.rs` | Colored percentage text with transparent, native-size premultiplied-alpha output |
-| `src/ui_tray_tests.rs` | Actual icon dimensions, transparent perimeter, glyph colors, and unknown-state checks |
+| `src/ui_tray.rs` | Large number tray indicator with transparent, native-size premultiplied-alpha output |
+| `src/ui_tray_tests.rs` | Native icon dimensions, rectangular text fit and margins, smooth coverage, theme colors, and unknown-state checks |
 | `src/codex.rs` | Codex executable discovery, app-server lifetime, protocol framing, and account reads |
+| `src/codex_lifecycle_tests.rs` | Offline helper reuse, graceful shutdown, cancellation, and recovery checks |
 | `src/claude.rs` | Claude Code status-line setup, bounded feed input, local feed storage, and subscription normalization |
 | `src/updater.rs` | GitHub release discovery, verified installer downloads, and update handoff |
 | `src/installation.rs` | Refresh an existing matching Installed Apps version after an in-place update |
@@ -29,15 +32,15 @@ The main thread owns Windows controls and the message queue. Account and update 
 
 Clicking or keyboard-activating the tray icon opens the panel; activating it again closes it. Escape or focus moving to another window dismisses it. Hover does not open the panel. Right-clicking the tray icon opens the menu.
 
-The panel uses a fixed black and dark-gray palette, `#7D0000` surfaces, and bright red highlights. Its rounded top-level window uses DWM attributes. The tray separately follows the Windows taskbar theme for legible text on light and dark backgrounds. Normal allowance uses light gray or charcoal, 21-50% uses muted red, 0-20% uses a stronger red, and unknown data uses neutral gray.
+The compact 320-by-292-DIP panel follows the Windows system/taskbar theme and uses the exact `UISettings.GetColorValue(Accent)` RGB for its primary action and horizontal usage bar. Text over the accent chooses black or white for readable contrast. Public DWM attributes provide the system border, rounded corners, and Desktop Acrylic (`DWMSBT_TRANSIENTWINDOW`), appropriate to a transient flyout. The DWM transient API selects the brightest Acrylic variant, which is visibly lighter than the taskbar. A shared theme tint over that material reduces its brightness while retaining one-third of the backdrop contribution. Parent and native child controls reproduce the same tinted base, including empty text areas and button corners. This approximates the taskbar tone; it does not retrieve Explorer's internal material or promise identical pixels over different backgrounds. Acrylic requires Windows 11 build 22621 or later; older systems and disabled transparency use a solid light or dark surface. Contrast themes use system colors and disable glass and motion. UISettings events and Windows theme messages apply appearance changes while the app is running. The tray follows the Windows taskbar theme for legibility on light and dark backgrounds. The usage header combines the provider and available subscription, such as `Codex · Pro`, with the selected period aligned at the right. A left-aligned remaining percentage sits above a horizontal allowance bar. The app name, logo, and separate subscription badge are omitted from the flyout. Reset times, credits, freshness and connection status, and the existing refresh/connect and settings actions remain available below the usage display.
 
-The percentage is a conventional notification-area icon registered with `Shell_NotifyIconW`. Windows owns the icon slot and its position among the other system-tray icons. `GetSystemMetricsForDpi(SM_CXSMICON, dpi)` supplies the target bitmap size: 16 pixels at 100% scaling. The renderer fits a single colored number-and-percent text run without changing its proportions and uses antialiased premultiplied-alpha pixels on a transparent background. Icon generation is cached until the displayed value, theme, provider, or DPI changes.
+The tray percentage is a conventional notification-area icon registered with `Shell_NotifyIconW`. Windows owns the icon slot and its position among the other system-tray icons. `GetSystemMetricsForDpi(SM_CXSMICON, dpi)` supplies the target bitmap size: 16 pixels at 100% scaling. The icon displays the remaining number from 0 to 100 without a percent sign. Visible Segoe UI glyph bounds select the largest font that fits the rectangular bitmap with a one-physical-pixel margin at 16 pixels, scaled proportionally at larger sizes. Native GDI renders the text at four times the target resolution; area averaging produces a smooth grayscale mask in the final premultiplied-alpha bitmap. The centered text uses the contrasting theme text color. Unknown or stale readings display `?`, and the native tooltip retains the full percentage wording. Rendering uses the monitor containing the actual tray icon rectangle, falling back to the primary taskbar monitor before the existing window DPI. Icon generation is cached until the displayed value, appearance, provider, or tray-monitor DPI changes; display changes refresh it through the existing event path.
 
 There is no taskbar child window, Explorer layout hook, floating label, or saved desktop position. Click opens the details panel anchored to `Shell_NotifyIconGetRect`; right-click opens settings. Hover notifications are ignored. Taskbar recreation re-registers the icon, and failed registration is retried by the existing five-second timer.
 
 Panel coordinates scale with the monitor DPI and are capped to fit the available work area. Placement is clamped at screen edges. Direct2D draws geometry, and DirectWrite renders Segoe UI with grayscale antialiasing and fractional font sizes at the actual display resolution. The panel is never rasterized at one scale and stretched to another.
 
-The Direct2D render target, brush, DirectWrite factory, and text formats are cached on the UI thread while the panel is open and released when it closes. Graphics failure permits a GDI fallback; device loss recreates the target on the next paint. There is no continuous rendering loop.
+The Direct2D render target uses software rendering explicitly; this small panel does not need a hardware graphics device. The render target, brush, DirectWrite factory, and text formats are cached on the UI thread while the panel is open and released when it closes. A premultiplied-alpha buffered DC preserves the translucent theme base for DWM, including pixels painted by native child controls. Graphics failure permits a GDI fallback; an invalid target is recreated on the next paint. Opening and closing use short, reversible slide transitions; hover and usage-meter changes also ease to their targets. A 16-ms timer exists only while a transition is active, then stops. Windows animation preferences apply immediately, including finishing an in-progress transition when animations are disabled. There is no continuous rendering loop.
 
 Labels and buttons remain native child controls with accessible names. Custom drawing retains keyboard navigation and visible focus, pressed, hover, and disabled states. A cached paint theme permits drawing during nested Windows callbacks. Bounded labels use ellipsis where necessary. Missing values use unavailable wording rather than a fabricated zero.
 
@@ -59,9 +62,9 @@ TokWatch UI -> account worker -> hidden native Codex helper
 
 The worker starts `codex.exe app-server --listen stdio://`. Newline-delimited JSON flows over redirected standard input/output. TokWatch completes `initialize` / `initialized`, then calls `account/read` and `account/rateLimits/read`. It does not create conversations, send model prompts, or redeem resets. `account/login/start` with `type: "chatgpt"` follows the user's Connect action.
 
-A normal refresh owns a fresh helper client only for the account read. Browser sign-in retains the helper until a matching `account/login/completed` event, with a five-minute limit. Individual requests time out after 30 seconds.
+Normal refreshes reuse one helper client. The worker reconnects after a failure, a helper exit, or an executable-path change; explicit Connect starts a fresh login connection. Switching to Claude releases the Codex helper. Browser sign-in waits for a matching `account/login/completed` event, with a five-minute limit, then reuses the authenticated helper for subsequent reads. Individual requests time out after 30 seconds. An idle helper remains resident between refreshes to avoid repeated startup and forced termination.
 
-The Windows helper starts without a console and belongs to a job configured to kill its processes when the job closes. Shutdown closes input, releases the job, terminates and waits for the helper, and joins the reader. The helper uses the user profile as its working directory.
+The Windows helper starts without a console and belongs to a job configured to kill its processes when the job closes. Shutdown closes input first and allows up to two seconds for the helper to exit before releasing the job; forced termination is a fallback for an unresponsive helper or remaining descendants. The worker waits for the helper and joins the reader. App exit cancels pending protocol waits (checked at most every 100 milliseconds while awaiting replies) and joins the worker so process exit does not bypass graceful cleanup. The helper uses the user profile as its working directory.
 
 Authentication belongs to Codex. TokWatch does not read authentication files or store credentials. It discards helper diagnostics and produces local user-facing errors. Replies are limited to 1 MiB and the reader queue holds at most eight messages. Unexpected server requests are not approved.
 
@@ -141,6 +144,6 @@ Use `scripts/build.ps1` for formatting, linting, tests, and local builds. The pr
 
 The release statically links the C/unwind runtime for supported x64 targets and uses normal Windows system DLLs. Build-only manifest embedding has no runtime helper. `.tools`, `target`, `dist`, and `.verification` stay out of source control. Packaging does not publish anything.
 
-Automated checks cover protocol normalization, missing fields, provider configuration, feed freshness, update parsing and verification, cache persistence, native layout, DirectWrite text fit, accessible controls, callback handling, and colored percentage icons. Rendering tests write panel and tray captures for visual inspection. An ignored live Codex test performs the handshake and read-only account calls and checks helper shutdown. Demo mode supplies simulated data without querying an account.
+Automated checks cover protocol normalization, missing fields, provider configuration, feed freshness, update parsing and verification, cache persistence, native layout at 100-200% scaling, DirectWrite text fit, accessible controls, callback handling, transparent parent/child pixel output, backdrop selection, transition cleanup, accent contrast, and number-only tray icons. Rendering tests write panel and tray captures for visual inspection. An ignored live Codex test performs the handshake and read-only account calls and checks helper shutdown. Demo mode supplies simulated data without querying an account.
 
-The README and v0.2.0 release notes record completed local validation. Live Claude session setup, actual replacement by a future release, fresh Codex browser sign-in, and broader interactive and long-running behavior need manual validation appropriate to the change; earlier v0.1.0 test counts are not claims about this preview.
+The README and v0.3.0 release notes record completed local validation. Live Claude session setup, actual replacement by a future release, fresh Codex browser sign-in, and broader interactive and long-running behavior need manual validation appropriate to the change; earlier v0.1.0 test counts are not claims about this preview.

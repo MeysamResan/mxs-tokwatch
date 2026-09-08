@@ -113,27 +113,28 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                         app.create_controls();
                         host.theme.set(PaintTheme::from_app(app));
                         app.render();
-                        assert_eq!(app.labels.len(), 16);
+                        assert_eq!(app.labels.len(), 14);
                         assert_eq!(app.buttons.len(), 2);
                         verify_control_bounds(app, dpi, dark, fixture);
                         verify_text_layout(app, dpi, dark, fixture);
                         verify_control_semantics(app);
                         match fixture {
                             Fixture::Normal => {
-                                assert_eq!(label_text(app.labels[4]), "26%");
-                                assert_eq!(label_text(app.labels[11]), "2");
+                                assert_eq!(label_text(app.labels[0]), "Codex · Pro");
+                                assert_eq!(label_text(app.labels[2]), "26%");
+                                assert_eq!(label_text(app.labels[9]), "2");
                             }
                             Fixture::Missing => {
-                                assert_eq!(label_text(app.labels[4]), "—");
-                                assert_eq!(label_text(app.labels[11]), "—");
+                                assert_eq!(label_text(app.labels[2]), "Usage unavailable");
+                                assert_eq!(label_text(app.labels[9]), "—");
                             }
                             Fixture::Long => {
-                                assert_eq!(label_text(app.labels[4]), "100%");
+                                assert_eq!(label_text(app.labels[2]), "100%");
                             }
                             Fixture::Claude => {
-                                assert_eq!(label_text(app.labels[4]), "72%");
-                                assert_eq!(label_text(app.labels[11]), "86%");
-                                assert_eq!(label_text(app.labels[14]), "Claude Code");
+                                assert_eq!(label_text(app.labels[2]), "72%");
+                                assert_eq!(label_text(app.labels[9]), "86%");
+                                assert_eq!(label_text(app.labels[12]), "Claude Code");
                             }
                         }
                     }
@@ -142,6 +143,16 @@ fn native_controls_fit_in_both_themes_at_common_dpi_scales() {
                     // configurations use the renderer's actual DirectWrite metrics.
                     if matches!(dpi, 96 | 144) {
                         capture_test_panel(hwnd, &host, dark, fixture);
+                        if matches!(fixture, Fixture::Normal) {
+                            // Check the actual alpha bytes delivered by parent and
+                            // native child DCs; a solid fallback must not mask glass.
+                            {
+                                let mut app = host.app.borrow_mut();
+                                app.glass = true;
+                                host.theme.set(PaintTheme::from_app(&app));
+                            }
+                            capture_test_panel(hwnd, &host, dark, fixture);
+                        }
                     }
                     destroy_test_panel(hwnd, &host);
                 }
@@ -202,9 +213,10 @@ unsafe fn verify_text_layout(app: &App, dpi: u32, dark: bool, fixture: Fixture) 
         let scale = dpi as f32 / 96.0;
         let tolerance = 1.0;
         for (index, hwnd) in app.labels.iter().enumerate() {
-            let text = label_text(*hwnd);
+            let accessible_text = label_text(*hwnd);
+            let text = ui_style::label_caption(index, &accessible_text);
             let (size, weight) = FONT_SPECS[LABEL_SPECS[index].4];
-            let extent = ui_render::measure_text(&text, size as f32 * scale, weight as u16)
+            let extent = ui_render::measure_text(text, size as f32 * scale, weight as u16)
                 .expect("DirectWrite text measurement must be available");
             let mut rect = RECT::default();
             GetClientRect(*hwnd, &mut rect).unwrap();
@@ -215,7 +227,7 @@ unsafe fn verify_text_layout(app: &App, dpi: u32, dark: bool, fixture: Fixture) 
                 "label {index} vertically clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' height {} vs {height}",
                 extent.height
             );
-            let external_metadata = matches!(index, 1 | 2 | 3 | 6 | 9 | 12 | 14 | 15);
+            let external_metadata = matches!(index, 0 | 1 | 4 | 7 | 10 | 12 | 13);
             assert!(
                 extent.width <= width + tolerance || external_metadata,
                 "label {index} horizontally clipped at {dpi} DPI (dark={dark}, {fixture:?}): '{text}' width {} vs {width}",
@@ -224,7 +236,7 @@ unsafe fn verify_text_layout(app: &App, dpi: u32, dark: bool, fixture: Fixture) 
         }
         for hwnd in &app.buttons {
             let text = label_text(*hwnd);
-            let extent = ui_render::measure_text(&text, 12.0 * scale, 400)
+            let extent = ui_render::measure_text(&text, 14.0 * scale, 400)
                 .expect("DirectWrite button text measurement must be available");
             let mut rect = RECT::default();
             GetClientRect(*hwnd, &mut rect).unwrap();
@@ -336,7 +348,13 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
         );
         let _ = GdiFlush();
         let data = std::slice::from_raw_parts(bits as *const u8, (width * height * 4) as usize);
-        verify_smoothed_card_corner(data, width, host.app.borrow().panel_dpi, dark);
+        let app = host.app.borrow();
+        verify_allowance_bar(data, width, &app);
+        if app.glass {
+            verify_glass_alpha(data, width, app.panel_dpi, dark);
+        } else {
+            verify_smoothed_card_corner(data, width, app.panel_dpi, dark);
+        }
         let mut bmp = Vec::new();
         bmp.extend_from_slice(b"BM");
         bmp.extend_from_slice(&(54 + data.len() as u32).to_le_bytes());
@@ -353,7 +371,11 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
         bmp.extend_from_slice(data);
         let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".verification");
         std::fs::create_dir_all(&directory).unwrap();
-        let theme = if dark { "dark" } else { "light" };
+        let theme = format!(
+            "{}{}",
+            if dark { "dark" } else { "light" },
+            if app.glass { "-glass" } else { "" }
+        );
         std::fs::write(
             directory.join(if host.app.borrow().panel_dpi == 96 {
                 format!("native-panel-{theme}-{}.bmp", fixture.name())
@@ -373,6 +395,92 @@ unsafe fn capture_test_panel(hwnd: HWND, host: &Host, dark: bool, fixture: Fixtu
     }
 }
 
+fn verify_allowance_bar(pixels: &[u8], width: i32, app: &App) {
+    let colors = app.palette();
+    let reading = app
+        .selected()
+        .and_then(|(_, window)| window.remaining_percent());
+    for offset in [16, 136, 256] {
+        let x = app.px(24 + offset);
+        let y = app.px(80);
+        let pixel = &pixels[((y * width + x) * 4) as usize..][..4];
+        let filled = reading.is_some() && offset as f32 / 272.0 < app.meter_value / 100.0;
+        let expected = if !filled {
+            colors.track
+        } else if app.stale() {
+            colors.muted
+        } else {
+            colors.accent
+        };
+        assert_eq!(
+            pixel,
+            &[
+                ((expected.0 >> 16) & 255) as u8,
+                ((expected.0 >> 8) & 255) as u8,
+                (expected.0 & 255) as u8,
+                255,
+            ],
+            "the horizontal bar must show the remaining amount from left to right"
+        );
+    }
+}
+fn verify_glass_alpha(pixels: &[u8], width: i32, dpi: u32, dark: bool) {
+    let pixel = |x: i32, y: i32| {
+        let (x, y) = (x * dpi as i32 / 96, y * dpi as i32 / 96);
+        let offset = ((y * width + x) * 4) as usize;
+        &pixels[offset..offset + 4]
+    };
+    let root = pixel(10, 10);
+    assert_eq!(
+        root[3], 170,
+        "the theme veil must retain one-third of the OS backdrop"
+    );
+    assert_eq!(
+        pixel(150, 199),
+        root,
+        "empty label pixels must match the root tint"
+    );
+    assert_eq!(
+        pixel(12, 250),
+        root,
+        "empty button corners must match the root tint"
+    );
+    let card = pixel(20, 50);
+    assert!(
+        (218..=221).contains(&card[3]),
+        "card alpha must include the shared base: {card:?}"
+    );
+    assert_eq!(
+        pixel(290, 20),
+        card,
+        "child label backgrounds must match the parent card"
+    );
+    assert_eq!(
+        pixel(18, 258)[3],
+        255,
+        "the primary button must remain opaque"
+    );
+    for pixel in pixels.chunks_exact(4) {
+        assert!(
+            pixel[..3].iter().all(|c| *c <= pixel[3]),
+            "color channels must remain premultiplied for DWM"
+        );
+    }
+    if dark {
+        // Regression reference: the user's captured DWM root was #545454;
+        // the nearby taskbar's median was #1C1D1E. This is an offline
+        // compositing check, not a claim that Explorer exposes its brush.
+        let taskbar_bgr = [30i32, 29, 28];
+        for channel in 0..3 {
+            let composed = root[channel] as i32 + 84 * (255 - root[3] as i32) / 255;
+            assert!(
+                (composed - taskbar_bgr[channel]).abs() <= 2,
+                "the dark flyout must stay within two levels of the taskbar reference"
+            );
+        }
+    }
+}
+
 fn verify_smoothed_card_corner(pixels: &[u8], width: i32, dpi: u32, dark: bool) {
     let colors = ui_style::palette(dark);
     let solid_colors = [colors.bg.0, colors.surface.0, colors.border.0];
@@ -381,8 +489,8 @@ fn verify_smoothed_card_corner(pixels: &[u8], width: i32, dpi: u32, dark: bool) 
     // This part of the hero's rounded corner contains no native child controls.
     // Aliased GDI geometry can produce only the three solid palette colors;
     // the Direct2D edge must contain intermediate coverage values.
-    for y in scale(50)..scale(62) {
-        for x in scale(12)..scale(24) {
+    for y in scale(10)..scale(18) {
+        for x in scale(12)..scale(20) {
             let offset = ((y * width + x) * 4) as usize;
             let color = pixels[offset + 2] as u32
                 | ((pixels[offset + 1] as u32) << 8)
@@ -612,6 +720,8 @@ fn tray_opens_only_on_selection_and_switches_provider_without_leaking_usage() {
         .unwrap();
         let host = new_host(hwnd, Settings::default(), Some(demo_snapshot()), true, None);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, (&*host as *const Host) as isize);
+        // Selection semantics are also required when Windows disables animation.
+        host.app.borrow_mut().appearance.animations = false;
         host.app.borrow_mut().create_controls();
         SendMessageW(
             hwnd,
@@ -660,13 +770,99 @@ fn tray_opens_only_on_selection_and_switches_provider_without_leaking_usage() {
             app.render();
             assert_eq!(app.settings.provider, Provider::Claude);
             assert_eq!(app.selected().unwrap().0.id, "claude");
-            assert_eq!(label_text(app.labels[4]), "72%");
+            assert_eq!(label_text(app.labels[2]), "72%");
             assert!(app.snapshot.as_ref().unwrap().reset_credits.is_none());
             app.switch_provider(Provider::Codex);
             assert_eq!(app.selected().unwrap().0.id, "codex");
             assert!(app.update_rx.is_none(), "demo must not check GitHub");
+            verify_motion_cleanup(&mut app);
+            verify_native_backdrop(&app);
         }
         destroy_test_panel(hwnd, &host);
         let _ = UnregisterClassW(name, Some(instance.into()));
+    }
+}
+
+// Exercise the production transition paths on this test's own native window.
+unsafe fn verify_motion_cleanup(app: &mut App) {
+    unsafe {
+        app.appearance.animations = true;
+        app.show(false);
+        assert!(app.panel_motion.is_some());
+        app.hide();
+        assert!(
+            app.visible,
+            "closing retains the window until the transition finishes"
+        );
+        assert_eq!(app.panel_motion.unwrap().target(), 0.0);
+        app.show(false);
+        assert_eq!(
+            app.panel_motion.unwrap().target(),
+            1.0,
+            "reopening reverses a close"
+        );
+        app.appearance.animations = false;
+        app.finish_motion();
+        assert!(app.visible);
+        assert_eq!(app.panel_value, 1.0);
+        assert!(app.panel_motion.is_none());
+        let mut rect = RECT::default();
+        GetWindowRect(app.hwnd, &mut rect).unwrap();
+        assert_eq!(
+            rect.top, app.panel_bounds.top,
+            "reduced motion snaps to the resting position"
+        );
+        assert_eq!(rect.left, app.panel_bounds.left);
+        app.appearance.animations = true;
+        app.hide();
+        app.panel_motion = Some(ui_motion::Tween::new(
+            1.0,
+            0.0,
+            Instant::now() - Duration::from_secs(1),
+            100,
+        ));
+        app.animate();
+        assert!(!app.visible);
+        assert!(!IsWindowVisible(app.hwnd).as_bool());
+        assert!(app.panel_motion.is_none() && app.meter_motion.is_none());
+        assert!(app.hover_motion.iter().all(Option::is_none));
+    }
+}
+
+unsafe fn verify_native_backdrop(app: &App) {
+    unsafe {
+        let mut appearance = app.appearance;
+        appearance.high_contrast = false;
+        appearance.transparency = true;
+        let applied = apply_window_style(app.hwnd, app.dark, appearance);
+        let mut material = DWMSBT_AUTO;
+        // Older Windows 11 builds have no public system backdrop attribute.
+        if DwmGetWindowAttribute(
+            app.hwnd,
+            DWMWA_SYSTEMBACKDROP_TYPE,
+            (&mut material as *mut DWM_SYSTEMBACKDROP_TYPE).cast(),
+            std::mem::size_of_val(&material) as u32,
+        )
+        .is_ok()
+        {
+            assert!(
+                applied,
+                "supported systems must accept the Acrylic backdrop"
+            );
+            assert_eq!(material, DWMSBT_TRANSIENTWINDOW);
+            appearance.transparency = false;
+            assert!(!apply_window_style(app.hwnd, app.dark, appearance));
+            DwmGetWindowAttribute(
+                app.hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                (&mut material as *mut DWM_SYSTEMBACKDROP_TYPE).cast(),
+                std::mem::size_of_val(&material) as u32,
+            )
+            .unwrap();
+            assert_eq!(
+                material, DWMSBT_NONE,
+                "disabling transparency removes the backdrop"
+            );
+        }
     }
 }

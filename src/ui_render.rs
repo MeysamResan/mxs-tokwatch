@@ -1,7 +1,10 @@
 //! Pixel-aligned native rendering. Windows owns all graphics and font resources;
-//! no bitmap scaling, animation loop, or additional UI runtime is involved.
+//! no bitmap scaling, permanent animation loop, or additional UI runtime is involved.
 
 use std::{cell::RefCell, collections::HashMap};
+use windows::Win32::UI::Controls::{
+    BPBF_TOPDOWNDIB, BeginBufferedPaint, BufferedPaintInit, BufferedPaintUnInit, EndBufferedPaint,
+};
 
 use windows::{
     Win32::{
@@ -56,10 +59,12 @@ impl Renderer {
         unsafe {
             let factory: ID2D1Factory = D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, None)?;
             let target = factory.CreateDCRenderTarget(&D2D1_RENDER_TARGET_PROPERTIES {
-                r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                // This small, event-driven panel does not need a GPU device.
+                // Keep driver/device-loss failures out of its drawing path.
+                r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
                 pixelFormat: D2D1_PIXEL_FORMAT {
                     format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_IGNORE,
+                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
                 },
                 // Coordinates already account for the current window's DPI. A
                 // second scale here would blur text and round fractional edges.
@@ -73,6 +78,7 @@ impl Renderer {
             target.SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
             let brush = target.CreateSolidColorBrush(&color(COLORREF(0)), None)?;
             let write = DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED)?;
+            BufferedPaintInit()?;
             Ok(Self {
                 target,
                 brush,
@@ -83,9 +89,17 @@ impl Renderer {
     }
 }
 
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = BufferedPaintUnInit();
+        }
+    }
+}
+
 /// Draw into the supplied DC rectangle using physical pixels. Drawing coordinates
 /// are local to the rectangle's top-left corner. The caller paints a complete
-/// opaque background and may use its GDI fallback when this returns false.
+/// background, or leaves pixels transparent for DWM, and may use a GDI fallback.
 pub(super) fn paint(dc: HDC, bounds: RECT, draw: impl FnOnce(&mut Canvas<'_>)) -> bool {
     if bounds.right <= bounds.left || bounds.bottom <= bounds.top {
         return false;
@@ -101,11 +115,19 @@ pub(super) fn paint(dc: HDC, bounds: RECT, draw: impl FnOnce(&mut Canvas<'_>)) -
             return false;
         };
         unsafe {
-            if renderer.target.BindDC(dc, &bounds).is_err() {
+            let mut buffered_dc = HDC::default();
+            let buffer = BeginBufferedPaint(dc, &bounds, BPBF_TOPDOWNDIB, None, &mut buffered_dc);
+            if buffer == 0 {
+                return false;
+            }
+            if renderer.target.BindDC(buffered_dc, &bounds).is_err() {
+                let _ = EndBufferedPaint(buffer, false);
                 *slot = None;
                 return false;
             }
             renderer.target.BeginDraw();
+            renderer.target.Clear(None);
+            renderer.brush.SetOpacity(1.0);
             let mut canvas = Canvas {
                 target: &renderer.target,
                 brush: &renderer.brush,
@@ -116,11 +138,12 @@ pub(super) fn paint(dc: HDC, bounds: RECT, draw: impl FnOnce(&mut Canvas<'_>)) -
             draw(&mut canvas);
             let failed = canvas.failed;
             let finished = renderer.target.EndDraw(None, None).is_ok();
+            let copied = EndBufferedPaint(buffer, finished && !failed).is_ok();
             if !finished {
                 // Device loss is recoverable: next paint recreates the target.
                 *slot = None;
             }
-            finished && !failed
+            copied && finished && !failed
         }
     })
 }
@@ -144,6 +167,12 @@ pub(super) struct Canvas<'a> {
 }
 
 impl Canvas<'_> {
+    pub(super) fn opacity(&mut self, alpha: f32) {
+        unsafe {
+            self.brush.SetOpacity(alpha.clamp(0.0, 1.0));
+        }
+    }
+
     pub(super) fn fill(&mut self, rect: RECT, fill: COLORREF) {
         unsafe {
             self.brush.SetColor(&color(fill));
@@ -209,6 +238,44 @@ impl Canvas<'_> {
                 self.brush.SetColor(&color(border));
                 self.target.DrawEllipse(&shape, self.brush, 1.0, None);
             }
+        }
+    }
+
+    pub(super) fn progress_bar(
+        &mut self,
+        rect: RECT,
+        percent: Option<f32>,
+        track: COLORREF,
+        progress: COLORREF,
+    ) {
+        let bounds = float_rect(rect);
+        let width = bounds.right - bounds.left;
+        let height = bounds.bottom - bounds.top;
+        if width <= 0.0 || height <= 0.0 {
+            return;
+        }
+        self.rounded(rect, height.min(width) * 0.5, track, None);
+        let Some(percent) = percent.filter(|p| p.is_finite()) else {
+            return;
+        };
+        let filled_width = width * percent.clamp(0.0, 100.0) / 100.0;
+        if filled_width <= 0.0 {
+            return;
+        }
+        unsafe {
+            // Use physical subpixels so short fills stay accurate during the
+            // brief value transition and at fractional display scales.
+            let radius = height.min(filled_width) * 0.5;
+            let shape = D2D1_ROUNDED_RECT {
+                rect: D2D_RECT_F {
+                    right: bounds.left + filled_width,
+                    ..bounds
+                },
+                radiusX: radius,
+                radiusY: radius,
+            };
+            self.brush.SetColor(&color(progress));
+            self.target.FillRoundedRectangle(&shape, self.brush);
         }
     }
 
